@@ -4,6 +4,12 @@ func opSload(evm *EVM) error {
 	slot := WordToHash(evm.stack.Pop())
 	addr := evm.state.Contract().Address()
 	value := evm.state.Storage().Get(addr, slot)
+	access := &StorageAccessInfo{Addr: addr, Slot: slot, Value: value, IsWrite: false}
+	if replaced, handled, err := evm.dispatchStorageAccessHook(0x54, HookTypeStorageRead, access); err != nil {
+		return err
+	} else if handled {
+		value = replaced
+	}
 	evm.stack.Push(HashToWord(value))
 	evm.pc++
 	return nil
@@ -15,6 +21,12 @@ func opSstore(evm *EVM) error {
 	addr := evm.state.Contract().Address()
 	if evm.state.Contract().IsStatic() {
 		return ErrWriteProtection
+	}
+	access := &StorageAccessInfo{Addr: addr, Slot: slot, Value: value, IsWrite: true}
+	if replaced, handled, err := evm.dispatchStorageAccessHook(0x55, HookTypeStorageWrite, access); err != nil {
+		return err
+	} else if handled {
+		value = replaced
 	}
 
 	gas := evm.gasMeter.Gas()
@@ -79,6 +91,12 @@ func opTload(evm *EVM) error {
 	slot := WordToHash(evm.stack.Pop())
 	addr := evm.state.Contract().Address()
 	value := evm.state.TransientStorage().Get(addr, slot)
+	access := &StorageAccessInfo{Addr: addr, Slot: slot, Value: value, IsWrite: false}
+	if replaced, handled, err := evm.dispatchStorageAccessHook(0x5C, HookTypeTransientLoad, access); err != nil {
+		return err
+	} else if handled {
+		value = replaced
+	}
 	evm.stack.Push(HashToWord(value))
 	evm.pc++
 	return nil
@@ -90,6 +108,12 @@ func opTstore(evm *EVM) error {
 	addr := evm.state.Contract().Address()
 	if evm.state.Contract().IsStatic() {
 		return ErrWriteProtection
+	}
+	access := &StorageAccessInfo{Addr: addr, Slot: slot, Value: value, IsWrite: true}
+	if replaced, handled, err := evm.dispatchStorageAccessHook(0x5D, HookTypeTransientStore, access); err != nil {
+		return err
+	} else if handled {
+		value = replaced
 	}
 	evm.state.TransientStorage().Set(addr, slot, value)
 	evm.pc++

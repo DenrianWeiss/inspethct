@@ -196,6 +196,16 @@ func supportedFixtureForks() map[string]Fork {
 	}
 }
 
+func shouldSkipVMFixturePath(path string, info os.FileInfo) bool {
+	if info == nil {
+		return false
+	}
+	if info.IsDir() {
+		return info.Name() == "vmPerformance"
+	}
+	return strings.Contains(path, string(filepath.Separator)+"vmPerformance"+string(filepath.Separator))
+}
+
 func runStateFixtureFile(t *testing.T, path string, total, skipped, passed, failed *int) {
 	supportedForks := supportedFixtureForks()
 	data, err := os.ReadFile(path)
@@ -218,9 +228,9 @@ func runStateFixtureFile(t *testing.T, path string, total, skipped, passed, fail
 				*total = *total + 1
 				testName := name + "/" + forkName + "/d" + itoa(entry.Indexes.Data) + "g" + itoa(entry.Indexes.Gas) + "v" + itoa(entry.Indexes.Value)
 				t.Run(testName, func(t *testing.T) {
-					if testing.Short() && strings.Contains(path, "vmPerformance") {
+					if shouldSkipVMFixturePath(path, fileInfo(path)) {
 						*skipped = *skipped + 1
-						t.Skip("performance test in short mode")
+						t.Skip("performance fixture excluded from default engine test run")
 					}
 					acc, sto := clonePreState(fix.Pre)
 					sender := hexToAddr(fix.Transaction.Sender)
@@ -316,8 +326,17 @@ func TestVMFixtures(t *testing.T) {
 	root := filepath.Join("evm-tests", "GeneralStateTests", "VMTests")
 	var total, skipped, passed, failed int
 	if err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || filepath.Ext(path) != ".json" {
+		if err != nil {
 			return err
+		}
+		if shouldSkipVMFixturePath(path, info) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.IsDir() || filepath.Ext(path) != ".json" {
+			return nil
 		}
 		runStateFixtureFile(t, path, &total, &skipped, &passed, &failed)
 		return nil
@@ -325,6 +344,14 @@ func TestVMFixtures(t *testing.T) {
 		t.Fatalf("walk: %v", err)
 	}
 	t.Logf("VM fixtures: total=%d passed=%d failed=%d skipped=%d", total, passed, failed, skipped)
+}
+
+func fileInfo(path string) os.FileInfo {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	return info
 }
 
 func TestPrecompileStateFixtures(t *testing.T) {
