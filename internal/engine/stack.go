@@ -8,9 +8,9 @@ const maxStackSize = 1024
 
 // EVMStack implements the Stack interface with a 1024-item limit.
 type EVMStack struct {
-	mu     sync.RWMutex
-	data   []Word
-	limit  int
+	mu    sync.RWMutex
+	data  []Word
+	limit int
 }
 
 // NewStack creates a new EVM stack.

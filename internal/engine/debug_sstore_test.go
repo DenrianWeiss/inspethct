@@ -40,13 +40,13 @@ func TestSstoreInFixture(t *testing.T) {
 				}
 
 				blockCtx := &SimpleBlockContext{
-					CoinbaseVal:    hexToAddr(fix.Env.CurrentCoinbase),
-					TimestampVal:   hexToBig(fix.Env.CurrentTimestamp).Uint64(),
-					NumberVal:      hexToBig(fix.Env.CurrentNumber),
-					DifficultyVal:  hexToBig(fix.Env.CurrentDifficulty),
-					GasLimitVal:    hexToBig(fix.Env.CurrentGasLimit).Uint64(),
-					BaseFeeVal:     hexToBig(fix.Env.CurrentBaseFee),
-					ChainIDVal:     big.NewInt(1),
+					CoinbaseVal:   hexToAddr(fix.Env.CurrentCoinbase),
+					TimestampVal:  hexToBig(fix.Env.CurrentTimestamp).Uint64(),
+					NumberVal:     hexToBig(fix.Env.CurrentNumber),
+					DifficultyVal: hexToBig(fix.Env.CurrentDifficulty),
+					GasLimitVal:   hexToBig(fix.Env.CurrentGasLimit).Uint64(),
+					BaseFeeVal:    hexToBig(fix.Env.CurrentBaseFee),
+					ChainIDVal:    big.NewInt(1),
 				}
 				txCtx := &SimpleTxContext{OriginVal: sender, GasPriceVal: gasPrice}
 				code := acc.Code(to)
@@ -55,20 +55,20 @@ func TestSstoreInFixture(t *testing.T) {
 				evmGasLimit := gasLimit - intrinsic
 
 				cfg := &ExecutionConfig{
-					Fork:            ForkLondon,
-					GasLimit:        evmGasLimit,
-					Value:           value,
-					Input:           dataBytes,
-					Origin:          sender,
-					Caller:          sender,
-					ContractAddress: to,
-					Code:            code,
-					BlockContext:    blockCtx,
-					TxContext:       txCtx,
-					State:           acc,
-					Storage:         sto,
+					Fork:             ForkLondon,
+					GasLimit:         evmGasLimit,
+					Value:            value,
+					Input:            dataBytes,
+					Origin:           sender,
+					Caller:           sender,
+					ContractAddress:  to,
+					Code:             code,
+					BlockContext:     blockCtx,
+					TxContext:        txCtx,
+					State:            acc,
+					Storage:          sto,
 					TransientStorage: NewInMemoryTransientStorage(),
-					AccessList:      NewSimpleAccessList(),
+					AccessList:       NewSimpleAccessList(),
 				}
 
 				state, _ := NewSimpleEngine().NewState(cfg)

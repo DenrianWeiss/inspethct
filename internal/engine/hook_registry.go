@@ -7,8 +7,8 @@ import (
 
 // SimpleHookRegistry implements HookRegistry with thread-safe operations.
 type SimpleHookRegistry struct {
-	mu    sync.RWMutex
-	hooks map[string]Hook
+	mu     sync.RWMutex
+	hooks  map[string]Hook
 	byType map[HookType][]Hook
 }
 
@@ -39,7 +39,7 @@ func (r *SimpleHookRegistry) Unregister(hookID string) error {
 		return fmt.Errorf("hook with ID %s not found", hookID)
 	}
 	delete(r.hooks, hookID)
-	
+
 	// Rebuild type index
 	hooks := r.byType[hook.Type()]
 	newHooks := make([]Hook, 0, len(hooks)-1)

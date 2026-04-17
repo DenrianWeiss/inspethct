@@ -115,6 +115,8 @@ func forkFromString(s string) Fork {
 		return ForkPrague
 	case "Amsterdam":
 		return ForkAmsterdam
+	case "Osaka":
+		return ForkOsaka
 	default:
 		return ""
 	}
@@ -182,178 +184,164 @@ func bytesEqual(a, b []byte) bool {
 	return string(a) == string(b)
 }
 
-// TestVMFixtures runs Ethereum VMTests state-fixtures against the engine.
-// Tests that require unsupported features (precompiles, full tx processing edge cases)
-// are skipped.
-func TestVMFixtures(t *testing.T) {
-	root := filepath.Join("evm-tests", "GeneralStateTests", "VMTests")
-
-	// Supported forks mapped from fixture names.
-	supportedForks := map[string]Fork{
+func supportedFixtureForks() map[string]Fork {
+	return map[string]Fork{
 		"London":    ForkLondon,
 		"Paris":     ForkParis,
 		"Shanghai":  ForkShanghai,
 		"Cancun":    ForkCancun,
 		"Prague":    ForkPrague,
 		"Amsterdam": ForkAmsterdam,
+		"Osaka":     ForkOsaka,
 	}
+}
 
-	// Counters for reporting.
+func runStateFixtureFile(t *testing.T, path string, total, skipped, passed, failed *int) {
+	supportedForks := supportedFixtureForks()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Logf("read %s: %v", path, err)
+		return
+	}
+	var fixtures map[string]stFixture
+	if err := json.Unmarshal(data, &fixtures); err != nil {
+		t.Logf("parse %s: %v", path, err)
+		return
+	}
+	for name, fix := range fixtures {
+		for forkName, entries := range fix.Post {
+			fork, ok := supportedForks[forkName]
+			if !ok {
+				continue
+			}
+			for _, entry := range entries {
+				*total = *total + 1
+				testName := name + "/" + forkName + "/d" + itoa(entry.Indexes.Data) + "g" + itoa(entry.Indexes.Gas) + "v" + itoa(entry.Indexes.Value)
+				t.Run(testName, func(t *testing.T) {
+					if testing.Short() && strings.Contains(path, "vmPerformance") {
+						*skipped = *skipped + 1
+						t.Skip("performance test in short mode")
+					}
+					acc, sto := clonePreState(fix.Pre)
+					sender := hexToAddr(fix.Transaction.Sender)
+					to := hexToAddr(fix.Transaction.To)
+					dataBytes := hexToBytes(fix.Transaction.Data[entry.Indexes.Data])
+					gasLimit := hexToBig(fix.Transaction.GasLimit[entry.Indexes.Gas]).Uint64()
+					value := hexToBig(fix.Transaction.Value[entry.Indexes.Value])
+					gasPrice := hexToBig(fix.Transaction.GasPrice)
+					acc.IncrementNonce(sender)
+					if value.Sign() > 0 {
+						if acc.Balance(sender).Cmp(value) < 0 {
+							*failed = *failed + 1
+							t.Fatalf("insufficient balance for value transfer")
+						}
+						acc.SubBalance(sender, value)
+						acc.AddBalance(to, value)
+					}
+					blockCtx := &SimpleBlockContext{
+						CoinbaseVal:   hexToAddr(fix.Env.CurrentCoinbase),
+						TimestampVal:  hexToBig(fix.Env.CurrentTimestamp).Uint64(),
+						NumberVal:     hexToBig(fix.Env.CurrentNumber),
+						DifficultyVal: hexToBig(fix.Env.CurrentDifficulty),
+						GasLimitVal:   hexToBig(fix.Env.CurrentGasLimit).Uint64(),
+						BaseFeeVal:    hexToBig(fix.Env.CurrentBaseFee),
+						ChainIDVal:    big.NewInt(1),
+					}
+					if fix.Env.CurrentRandom != "" {
+						blockCtx.RandomVal = hexToHash(fix.Env.CurrentRandom)
+					}
+					txCtx := &SimpleTxContext{OriginVal: sender, GasPriceVal: gasPrice}
+					code := acc.Code(to)
+					intrinsic := intrinsicGas(dataBytes)
+					evmGasLimit := gasLimit
+					if evmGasLimit > intrinsic {
+						evmGasLimit -= intrinsic
+					} else {
+						*failed = *failed + 1
+						t.Fatalf("insufficient gas for intrinsic cost")
+					}
+					cfg := &ExecutionConfig{
+						Fork:             fork,
+						GasLimit:         evmGasLimit,
+						Value:            value,
+						Input:            dataBytes,
+						Origin:           sender,
+						Caller:           sender,
+						ContractAddress:  to,
+						Code:             code,
+						CodeHash:         hashCode(code),
+						BlockContext:     blockCtx,
+						TxContext:        txCtx,
+						State:            acc,
+						Storage:          sto,
+						TransientStorage: NewInMemoryTransientStorage(),
+						AccessList:       NewSimpleAccessList(),
+					}
+					eng := NewSimpleEngine()
+					res, err := eng.Run(cfg)
+					if res != nil {
+						gasUsed := gasLimit - res.GasRemaining
+						refund := res.GasRefund
+						maxRefund := gasUsed / 5
+						if refund > maxRefund {
+							refund = maxRefund
+						}
+						if gasUsed > refund {
+							gasUsed -= refund
+						} else {
+							gasUsed = 0
+						}
+						cost := new(big.Int).Mul(new(big.Int).SetUint64(gasUsed), gasPrice)
+						acc.SubBalance(sender, cost)
+						acc.AddBalance(blockCtx.CoinbaseVal, cost)
+					}
+					mismatches := compareState(acc, sto, entry.State)
+					if len(mismatches) > 0 {
+						*failed = *failed + 1
+						for _, m := range mismatches {
+							t.Logf("mismatch: %s", m)
+						}
+						t.Fatalf("state mismatch (%d fields)", len(mismatches))
+					}
+					_ = err
+					*passed = *passed + 1
+				})
+			}
+		}
+	}
+}
+
+// TestVMFixtures runs Ethereum VMTests state-fixtures against the engine.
+func TestVMFixtures(t *testing.T) {
+	root := filepath.Join("evm-tests", "GeneralStateTests", "VMTests")
 	var total, skipped, passed, failed int
-
-	// Walk all JSON fixtures under VMTests.
 	if err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || filepath.Ext(path) != ".json" {
 			return err
 		}
-
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Logf("read %s: %v", path, err)
-			return nil
-		}
-
-		var fixtures map[string]stFixture
-		if err := json.Unmarshal(data, &fixtures); err != nil {
-			t.Logf("parse %s: %v", path, err)
-			return nil
-		}
-
-		for name, fix := range fixtures {
-			for forkName, entries := range fix.Post {
-				fork, ok := supportedForks[forkName]
-				if !ok {
-					continue
-				}
-
-				for _, entry := range entries {
-					total++
-					testName := name + "/" + forkName + "/d" + itoa(entry.Indexes.Data) + "g" + itoa(entry.Indexes.Gas) + "v" + itoa(entry.Indexes.Value)
-
-					t.Run(testName, func(t *testing.T) {
-						// Skip performance tests in short mode.
-						if testing.Short() && strings.Contains(path, "vmPerformance") {
-							skipped++
-							t.Skip("performance test in short mode")
-						}
-
-						acc, sto := clonePreState(fix.Pre)
-
-						// Transaction params from indexed arrays.
-						sender := hexToAddr(fix.Transaction.Sender)
-						to := hexToAddr(fix.Transaction.To)
-						dataBytes := hexToBytes(fix.Transaction.Data[entry.Indexes.Data])
-						gasLimit := hexToBig(fix.Transaction.GasLimit[entry.Indexes.Gas]).Uint64()
-						value := hexToBig(fix.Transaction.Value[entry.Indexes.Value])
-						gasPrice := hexToBig(fix.Transaction.GasPrice)
-
-						// Transaction-level nonce increment.
-						acc.IncrementNonce(sender)
-
-						// Transaction-level value transfer.
-						if value.Sign() > 0 {
-							if acc.Balance(sender).Cmp(value) < 0 {
-								failed++
-								t.Fatalf("insufficient balance for value transfer")
-							}
-							acc.SubBalance(sender, value)
-							acc.AddBalance(to, value)
-						}
-
-						// Build block context from env.
-						blockCtx := &SimpleBlockContext{
-							CoinbaseVal:   hexToAddr(fix.Env.CurrentCoinbase),
-							TimestampVal:  hexToBig(fix.Env.CurrentTimestamp).Uint64(),
-							NumberVal:     hexToBig(fix.Env.CurrentNumber),
-							DifficultyVal: hexToBig(fix.Env.CurrentDifficulty),
-							GasLimitVal:   hexToBig(fix.Env.CurrentGasLimit).Uint64(),
-							BaseFeeVal:    hexToBig(fix.Env.CurrentBaseFee),
-							ChainIDVal:    big.NewInt(1),
-						}
-						if fix.Env.CurrentRandom != "" {
-							blockCtx.RandomVal = hexToHash(fix.Env.CurrentRandom)
-						}
-
-						txCtx := &SimpleTxContext{
-							OriginVal:   sender,
-							GasPriceVal: gasPrice,
-						}
-
-						code := acc.Code(to)
-
-						// Compute intrinsic gas and deduct from gas limit before EVM execution.
-						intrinsic := intrinsicGas(dataBytes)
-						evmGasLimit := gasLimit
-						if evmGasLimit > intrinsic {
-							evmGasLimit -= intrinsic
-						} else {
-							// Insufficient gas for intrinsic cost.
-							failed++
-							t.Fatalf("insufficient gas for intrinsic cost")
-						}
-
-						cfg := &ExecutionConfig{
-							Fork:             fork,
-							GasLimit:         evmGasLimit,
-							Value:            value,
-							Input:            dataBytes,
-							Origin:           sender,
-							Caller:           sender,
-							ContractAddress:  to,
-							Code:             code,
-							CodeHash:         hashCode(code),
-							BlockContext:     blockCtx,
-							TxContext:        txCtx,
-							State:            acc,
-							Storage:          sto,
-							TransientStorage: NewInMemoryTransientStorage(),
-							AccessList:       NewSimpleAccessList(),
-						}
-
-						eng := NewSimpleEngine()
-						res, err := eng.Run(cfg)
-
-						// Apply transaction gas cost after execution.
-						if res != nil {
-							gasUsed := gasLimit - res.GasRemaining
-							// Apply refund cap: max refund is gasUsed/5 (EIP-3529, London+)
-							refund := res.GasRefund
-							maxRefund := gasUsed / 5
-							if refund > maxRefund {
-								refund = maxRefund
-							}
-							if gasUsed > refund {
-								gasUsed -= refund
-							} else {
-								gasUsed = 0
-							}
-							cost := new(big.Int).Mul(new(big.Int).SetUint64(gasUsed), gasPrice)
-							acc.SubBalance(sender, cost)
-							acc.AddBalance(blockCtx.CoinbaseVal, cost)
-						}
-
-						// Compare state.
-						mismatches := compareState(acc, sto, entry.State)
-						if len(mismatches) > 0 {
-							failed++
-							for _, m := range mismatches {
-								t.Logf("mismatch: %s", m)
-							}
-							t.Fatalf("state mismatch (%d fields)", len(mismatches))
-						}
-
-						_ = err
-						passed++
-					})
-				}
-			}
-		}
+		runStateFixtureFile(t, path, &total, &skipped, &passed, &failed)
 		return nil
 	}); err != nil {
 		t.Fatalf("walk: %v", err)
 	}
-
 	t.Logf("VM fixtures: total=%d passed=%d failed=%d skipped=%d", total, passed, failed, skipped)
+}
+
+func TestPrecompileStateFixtures(t *testing.T) {
+	files := []string{
+		filepath.Join("evm-tests", "GeneralStateTests", "stExtCodeHash", "extCodeHashPrecompiles.json"),
+		filepath.Join("evm-tests", "GeneralStateTests", "stStaticCall", "StaticcallToPrecompileFromTransaction.json"),
+		filepath.Join("evm-tests", "GeneralStateTests", "stReturnDataTest", "create_callprecompile_returndatasize.json"),
+		filepath.Join("evm-tests", "GeneralStateTests", "stCreate2", "create2callPrecompiles.json"),
+	}
+	var total, skipped, passed, failed int
+	for _, path := range files {
+		path := path
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			runStateFixtureFile(t, path, &total, &skipped, &passed, &failed)
+		})
+	}
+	t.Logf("precompile fixtures: total=%d passed=%d failed=%d skipped=%d", total, passed, failed, skipped)
 }
 
 func itoa(i int) string {

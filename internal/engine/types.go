@@ -57,6 +57,7 @@ const (
 	ForkCancun    Fork = "cancun"
 	ForkPrague    Fork = "prague"
 	ForkAmsterdam Fork = "amsterdam"
+	ForkOsaka     Fork = "osaka"
 )
 
 // Log represents an EVM LOG operation output.

@@ -77,6 +77,16 @@ func (evm *EVM) ExecuteMessage(msg *Message) (*ExecutionResult, error) {
 		account.CreateAccount(msg.Callee)
 	}
 
+	if precompile, ok := evm.resolvePrecompile(msg.CodeAddr); ok {
+		res, err := evm.executePrecompileMessage(msg, precompile)
+		if res != nil && res.Status != StatusSuccess {
+			account.RevertToSnapshot(accSnap)
+			evm.state.Storage().RevertToSnapshot(stoSnap)
+			res.GasRemaining = 0
+		}
+		return res, err
+	}
+
 	// Load code
 	code := msg.Code
 	if len(code) == 0 {
@@ -86,7 +96,7 @@ func (evm *EVM) ExecuteMessage(msg *Message) (*ExecutionResult, error) {
 
 	// Build child state
 	childState := evm.newChildState(msg)
-	childEVM := NewEVM(childState, evm.fork)
+	childEVM := NewEVM(childState, evm.fork, evm.precompiles)
 	childEVM.returnData = evm.returnData // inherit return data buffer initially
 	childEVM.SetHooks(evm.hooks)         // propagate hooks/breakpoints to child
 

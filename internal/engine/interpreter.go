@@ -7,15 +7,16 @@ import (
 
 // EVM is the core execution engine.
 type EVM struct {
-	state      EVMState
-	fork       Fork
-	gasMeter   GasMeter
-	stack      Stack
-	memory     Memory
-	pc         uint64
-	returnData []byte
-	jumpdests  map[uint64]bool
-	hooks      HookRegistry
+	state       EVMState
+	fork        Fork
+	precompiles *PrecompileRegistry
+	gasMeter    GasMeter
+	stack       Stack
+	memory      Memory
+	pc          uint64
+	returnData  []byte
+	jumpdests   map[uint64]bool
+	hooks       HookRegistry
 }
 
 func safeAddUint64(values ...uint64) (uint64, bool) {
@@ -50,15 +51,27 @@ func wordCount(size uint64) uint64 {
 }
 
 // NewEVM creates a new EVM instance.
-func NewEVM(state EVMState, fork Fork) *EVM {
-	return &EVM{
-		state:     state,
-		fork:      fork,
-		gasMeter:  state.GasMeter(),
-		stack:     state.Stack(),
-		memory:    state.Memory(),
-		jumpdests: make(map[uint64]bool),
+func NewEVM(state EVMState, fork Fork, registries ...*PrecompileRegistry) *EVM {
+	var registry *PrecompileRegistry
+	if len(registries) > 0 {
+		registry = registries[0]
 	}
+	if registry == nil {
+		registry = MainnetPrecompilesForFork(fork)
+	}
+	return &EVM{
+		state:       state,
+		fork:        fork,
+		precompiles: registry,
+		gasMeter:    state.GasMeter(),
+		stack:       state.Stack(),
+		memory:      state.Memory(),
+		jumpdests:   make(map[uint64]bool),
+	}
+}
+
+func NewMainnetEVM(state EVMState, fork Fork) *EVM {
+	return NewEVM(state, fork, MainnetPrecompilesForFork(fork))
 }
 
 // SetHooks attaches a hook registry to the EVM.
@@ -684,6 +697,7 @@ func forkGTE(a, b Fork) bool {
 		ForkCancun:    3,
 		ForkPrague:    4,
 		ForkAmsterdam: 5,
+		ForkOsaka:     6,
 	}
 	return order[a] >= order[b]
 }

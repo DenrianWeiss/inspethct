@@ -12,8 +12,8 @@ func TestDebugAdd(t *testing.T) {
 
 	// Setup accounts from add.json pre-state
 	accounts := map[string]struct {
-		bal  string
-		code string
+		bal   string
+		code  string
 		nonce string
 	}{
 		"0x0000000000000000000000000000000000001000": {"0x0ba1a9ce0ba1a9ce", "0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0160005500", "0x00"},
@@ -44,14 +44,14 @@ func TestDebugAdd(t *testing.T) {
 	acc.AddBalance(to, value)
 
 	blockCtx := &SimpleBlockContext{
-		CoinbaseVal:    hexToAddr("0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba"),
-		TimestampVal:   hexToBig("0x03e8").Uint64(),
-		NumberVal:      hexToBig("0x01"),
-		DifficultyVal:  hexToBig("0x020000"),
-		GasLimitVal:    hexToBig("0x05f5e100").Uint64(),
-		BaseFeeVal:     hexToBig("0x0a"),
-		ChainIDVal:     big.NewInt(1),
-		RandomVal:      hexToHash("0x0000000000000000000000000000000000000000000000000000000000020000"),
+		CoinbaseVal:   hexToAddr("0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba"),
+		TimestampVal:  hexToBig("0x03e8").Uint64(),
+		NumberVal:     hexToBig("0x01"),
+		DifficultyVal: hexToBig("0x020000"),
+		GasLimitVal:   hexToBig("0x05f5e100").Uint64(),
+		BaseFeeVal:    hexToBig("0x0a"),
+		ChainIDVal:    big.NewInt(1),
+		RandomVal:     hexToHash("0x0000000000000000000000000000000000000000000000000000000000020000"),
 	}
 
 	txCtx := &SimpleTxContext{

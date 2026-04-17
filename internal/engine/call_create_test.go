@@ -26,7 +26,7 @@ func TestCallSuccess(t *testing.T) {
 		0x60, 0x00, // inSize
 		0x60, 0x00, // inOffset
 		0x60, 0x00, // value
-		0x73,       // PUSH20
+		0x73, // PUSH20
 	}
 	callerCode = append(callerCode, calleeAddr[:]...)
 	callerCode = append(callerCode, 0x61, 0xFF, 0xFF, 0xF1, 0x00)
@@ -132,7 +132,7 @@ func TestCallDepthLimit(t *testing.T) {
 		0x60, 0x00, // inSize
 		0x60, 0x00, // inOffset
 		0x60, 0x00, // value
-		0x73,       // PUSH20 self
+		0x73, // PUSH20 self
 	}
 	code = append(code, self[:]...)
 	code = append(code, 0x61, 0xFF, 0xFF, 0xF1, 0x00)
@@ -184,7 +184,7 @@ func TestStaticCallWriteProtectionInCall(t *testing.T) {
 		0x60, 0x00, // retOffset
 		0x60, 0x00, // inSize
 		0x60, 0x00, // inOffset
-		0x73,       // PUSH20 callee
+		0x73, // PUSH20 callee
 	}
 	callerCode = append(callerCode, calleeAddr[:]...)
 	callerCode = append(callerCode, 0x61, 0xFF, 0xFF, 0xFA, 0x00)
@@ -231,7 +231,7 @@ func TestDelegateCallValue(t *testing.T) {
 		0x60, 0x00, // retOffset
 		0x60, 0x00, // inSize
 		0x60, 0x00, // inOffset
-		0x73,       // PUSH20 callee
+		0x73, // PUSH20 callee
 	}
 	callerCode = append(callerCode, calleeAddr[:]...)
 	callerCode = append(callerCode, 0x61, 0xFF, 0xFF, 0xF4, 0x00)
@@ -279,14 +279,14 @@ func TestCreateAddress(t *testing.T) {
 	offset := 15
 	code := []byte{
 		0x60, byte(len(initCode)), // size
-		0x60, byte(offset),        // codeOffset
-		0x60, 0x00,                // destOffset
+		0x60, byte(offset), // codeOffset
+		0x60, 0x00, // destOffset
 		0x39,                      // CODECOPY
 		0x60, byte(len(initCode)), // size
-		0x60, 0x00,                // offset
-		0x60, 0x00,                // value
-		0xF0,                      // CREATE
-		0x00,                      // STOP
+		0x60, 0x00, // offset
+		0x60, 0x00, // value
+		0xF0, // CREATE
+		0x00, // STOP
 	}
 	code = append(code, initCode...)
 
@@ -331,15 +331,15 @@ func TestCreate2Address(t *testing.T) {
 	offset := 17
 	code := []byte{
 		0x60, byte(len(initCode)), // size
-		0x60, byte(offset),        // codeOffset
-		0x60, 0x00,                // destOffset
-		0x39,                      // CODECOPY
-		0x60, 0x42,                // salt
+		0x60, byte(offset), // codeOffset
+		0x60, 0x00, // destOffset
+		0x39,       // CODECOPY
+		0x60, 0x42, // salt
 		0x60, byte(len(initCode)), // size
-		0x60, 0x00,                // offset
-		0x60, 0x00,                // value
-		0xF5,                      // CREATE2
-		0x00,                      // STOP
+		0x60, 0x00, // offset
+		0x60, 0x00, // value
+		0xF5, // CREATE2
+		0x00, // STOP
 	}
 	code = append(code, initCode...)
 
@@ -605,9 +605,9 @@ type testHook struct {
 	fireFn   func(ctx *HookContext) (*HookResult, error)
 }
 
-func (h *testHook) Type() HookType   { return h.hookType }
-func (h *testHook) OneTime() bool    { return h.once }
-func (h *testHook) ID() string       { return h.id }
+func (h *testHook) Type() HookType { return h.hookType }
+func (h *testHook) OneTime() bool  { return h.once }
+func (h *testHook) ID() string     { return h.id }
 func (h *testHook) Fire(ctx *HookContext) (*HookResult, error) {
 	return h.fireFn(ctx)
 }

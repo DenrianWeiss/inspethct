@@ -182,5 +182,5 @@ func (c *ConditionalHook) Fire(ctx *HookContext) (*HookResult, error) {
 	}
 	return c.Inner.Fire(ctx)
 }
-func (c *ConditionalHook) OneTime() bool  { return c.Inner.OneTime() }
-func (c *ConditionalHook) ID() string     { return c.Inner.ID() }
+func (c *ConditionalHook) OneTime() bool { return c.Inner.OneTime() }
+func (c *ConditionalHook) ID() string    { return c.Inner.ID() }

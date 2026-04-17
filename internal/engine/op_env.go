@@ -121,6 +121,11 @@ func opGasprice(evm *EVM) error {
 
 func opExtcodesize(evm *EVM) error {
 	addr := addressFromWord(evm.stack.Pop())
+	if evm.isPrecompileAddress(addr) && !evm.state.Account().Exists(addr) {
+		evm.stack.Push(Word{})
+		evm.pc++
+		return nil
+	}
 	size := evm.state.Account().CodeSize(addr)
 	evm.stack.Push(BigToWord(big.NewInt(int64(size))))
 	evm.pc++
@@ -169,6 +174,11 @@ func opReturndatacopy(evm *EVM) error {
 
 func opExtcodehash(evm *EVM) error {
 	addr := addressFromWord(evm.stack.Pop())
+	if evm.isPrecompileAddress(addr) && !evm.state.Account().Exists(addr) {
+		evm.stack.Push(Word{})
+		evm.pc++
+		return nil
+	}
 	if !evm.state.Account().Exists(addr) {
 		evm.stack.Push(Word{})
 	} else {

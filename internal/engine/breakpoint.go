@@ -9,18 +9,18 @@ import (
 type BreakpointReason string
 
 const (
-	ReasonOpcode         BreakpointReason = "opcode"
-	ReasonCall           BreakpointReason = "call"
-	ReasonStorageRead    BreakpointReason = "storage_read"
-	ReasonStorageWrite   BreakpointReason = "storage_write"
-	ReasonMemoryRead     BreakpointReason = "memory_read"
-	ReasonMemoryWrite    BreakpointReason = "memory_write"
-	ReasonLog            BreakpointReason = "log"
-	ReasonSelfDestruct   BreakpointReason = "self_destruct"
-	ReasonReturn         BreakpointReason = "return"
-	ReasonStep           BreakpointReason = "step"
-	ReasonException      BreakpointReason = "exception"
-	ReasonManual         BreakpointReason = "manual"
+	ReasonOpcode       BreakpointReason = "opcode"
+	ReasonCall         BreakpointReason = "call"
+	ReasonStorageRead  BreakpointReason = "storage_read"
+	ReasonStorageWrite BreakpointReason = "storage_write"
+	ReasonMemoryRead   BreakpointReason = "memory_read"
+	ReasonMemoryWrite  BreakpointReason = "memory_write"
+	ReasonLog          BreakpointReason = "log"
+	ReasonSelfDestruct BreakpointReason = "self_destruct"
+	ReasonReturn       BreakpointReason = "return"
+	ReasonStep         BreakpointReason = "step"
+	ReasonException    BreakpointReason = "exception"
+	ReasonManual       BreakpointReason = "manual"
 )
 
 // BreakpointCondition defines a predicate evaluated to decide if a breakpoint should fire.
@@ -256,10 +256,10 @@ type BreakpointManager struct {
 	breakpoints map[string]*Breakpoint
 	registry    HookRegistry
 
-	stepping     bool
-	stepTarget   BreakpointAction
-	stepDepth    int
-	stepCallID   uint64
+	stepping   bool
+	stepTarget BreakpointAction
+	stepDepth  int
+	stepCallID uint64
 }
 
 // NewBreakpointManager creates a breakpoint manager backed by a hook registry.

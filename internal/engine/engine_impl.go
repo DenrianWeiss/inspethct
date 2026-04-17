@@ -30,11 +30,33 @@ func warmInitialAccessList(accessList AccessList, cfg *ExecutionConfig) {
 	if forkGTE(cfg.Fork, ForkShanghai) && cfg.BlockContext != nil {
 		accessList.WarmAddress(cfg.BlockContext.Coinbase())
 	}
-	for i := uint64(1); i <= 9; i++ {
-		var addr Address
-		addr[19] = byte(i)
+	for _, addr := range warmAddressesForConfig(cfg) {
 		accessList.WarmAddress(addr)
 	}
+}
+
+func warmAddressesForConfig(cfg *ExecutionConfig) []Address {
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[Address]struct{})
+	addrs := make([]Address, 0)
+	appendUnique := func(values []Address) {
+		for _, addr := range values {
+			if _, ok := seen[addr]; ok {
+				continue
+			}
+			seen[addr] = struct{}{}
+			addrs = append(addrs, addr)
+		}
+	}
+	if cfg.Precompiles != nil {
+		appendUnique(cfg.Precompiles.Addresses())
+	} else {
+		appendUnique(MainnetPrecompileAddresses(cfg.Fork))
+	}
+	appendUnique(cfg.WarmAddresses)
+	return addrs
 }
 
 func applyBaseFeeBurn(state EVMState, cfg *ExecutionConfig, res *ExecutionResult) {
@@ -75,20 +97,20 @@ func (e *SimpleEngine) Run(cfg *ExecutionConfig) (*ExecutionResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	res, err := e.runWithFork(state, cfg.Code, cfg.Fork)
+	res, err := e.runWithFork(state, cfg.Code, cfg.Fork, cfg.Precompiles)
 	applyBaseFeeBurn(state, cfg, res)
 	return res, err
 }
 
 func (e *SimpleEngine) RunWithState(state EVMState, code []byte) (*ExecutionResult, error) {
-	return e.runWithFork(state, code, ForkLondon)
+	return e.runWithFork(state, code, ForkLondon, nil)
 }
 
-func (e *SimpleEngine) runWithFork(state EVMState, code []byte, fork Fork) (*ExecutionResult, error) {
+func (e *SimpleEngine) runWithFork(state EVMState, code []byte, fork Fork, precompiles *PrecompileRegistry) (*ExecutionResult, error) {
 	if fork == "" {
 		fork = ForkLondon
 	}
-	evm := NewEVM(state, fork)
+	evm := NewEVM(state, fork, precompiles)
 	return evm.Run(code)
 }
 
@@ -155,7 +177,7 @@ func (e *SimpleEngine) NewState(cfg *ExecutionConfig) (EVMState, error) {
 }
 
 func (e *SimpleEngine) SupportedForks() []Fork {
-	return []Fork{ForkLondon, ForkParis, ForkShanghai, ForkCancun, ForkPrague, ForkAmsterdam}
+	return []Fork{ForkLondon, ForkParis, ForkShanghai, ForkCancun, ForkPrague, ForkAmsterdam, ForkOsaka}
 }
 
 func (e *SimpleEngine) ValidateConfig(cfg *ExecutionConfig) error {

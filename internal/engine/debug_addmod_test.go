@@ -33,14 +33,14 @@ func TestDebugAddmodD0(t *testing.T) {
 	acc.IncrementNonce(sender)
 
 	blockCtx := &SimpleBlockContext{
-		CoinbaseVal:    hexToAddr("0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba"),
-		TimestampVal:   0x03e8,
-		NumberVal:      big.NewInt(1),
-		DifficultyVal:  hexToBig("0x020000"),
-		GasLimitVal:    0x05f5e100,
-		BaseFeeVal:     hexToBig("0x0a"),
-		ChainIDVal:     big.NewInt(1),
-		RandomVal:      hexToHash("0x0000000000000000000000000000000000000000000000000000000000020000"),
+		CoinbaseVal:   hexToAddr("0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba"),
+		TimestampVal:  0x03e8,
+		NumberVal:     big.NewInt(1),
+		DifficultyVal: hexToBig("0x020000"),
+		GasLimitVal:   0x05f5e100,
+		BaseFeeVal:    hexToBig("0x0a"),
+		ChainIDVal:    big.NewInt(1),
+		RandomVal:     hexToHash("0x0000000000000000000000000000000000000000000000000000000000020000"),
 	}
 	txCtx := &SimpleTxContext{
 		OriginVal:   sender,
@@ -111,9 +111,9 @@ type addmodTraceHook struct {
 	t *testing.T
 }
 
-func (h *addmodTraceHook) Type() HookType   { return HookTypeOpcode }
-func (h *addmodTraceHook) OneTime() bool    { return false }
-func (h *addmodTraceHook) ID() string       { return "addmod-trace" }
+func (h *addmodTraceHook) Type() HookType { return HookTypeOpcode }
+func (h *addmodTraceHook) OneTime() bool  { return false }
+func (h *addmodTraceHook) ID() string     { return "addmod-trace" }
 
 func (h *addmodTraceHook) Fire(ctx *HookContext) (*HookResult, error) {
 	info := ctx.Opcode

@@ -6,6 +6,10 @@ import "math/big"
 type ExecutionConfig struct {
 	// Fork specifies which hard-fork rules to apply.
 	Fork Fork
+	// Precompiles overrides the active precompile registry for this execution.
+	Precompiles *PrecompileRegistry
+	// WarmAddresses adds custom addresses to the initial warm set.
+	WarmAddresses []Address
 	// GasLimit is the maximum gas for this execution.
 	GasLimit uint64
 	// Value is the ETH value transferred in the message.
