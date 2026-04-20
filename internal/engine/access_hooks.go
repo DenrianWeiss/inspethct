@@ -6,9 +6,10 @@ func (evm *EVM) hookContextForOpcode(op byte) *HookContext {
 	return &HookContext{
 		State: NewReadOnlyState(evm.state),
 		Opcode: &OpcodeInfo{
-			PC:      evm.pc,
-			Op:      op,
-			GasCost: GasCosts[op],
+			PC:           evm.pc,
+			Op:           op,
+			GasRemaining: evm.gasMeter.Gas(),
+			GasCost:      GasCosts[op],
 		},
 	}
 }

@@ -128,6 +128,8 @@ func (evm *EVM) Run(code []byte) (res *ExecutionResult, err error) {
 			return builder.Build(), ErrInvalidOpcode
 		}
 
+		gasBefore := evm.gasMeter.Gas()
+
 		// Get base gas cost
 		gasCost := GasCosts[op]
 
@@ -153,7 +155,7 @@ func (evm *EVM) Run(code []byte) (res *ExecutionResult, err error) {
 		}
 
 		// Hook dispatch
-		if skip, err := evm.dispatchHooks(op, opName); err != nil {
+		if skip, err := evm.dispatchHooks(op, opName, gasBefore, totalGas); err != nil {
 			status := classifyError(err)
 			builder.SetStatus(status)
 			builder.SetError(err)
@@ -603,15 +605,16 @@ func (evm *EVM) calcDynamicGas(op byte, code []byte) (uint64, error) {
 
 // dispatchHooks fires registered hooks for the current opcode step.
 // Returns (skipExecution bool, err error).
-func (evm *EVM) dispatchHooks(op byte, opName string) (bool, error) {
+func (evm *EVM) dispatchHooks(op byte, opName string, gasRemaining uint64, gasCost uint64) (bool, error) {
 	if evm.hooks == nil {
 		return false, nil
 	}
 
 	info := &OpcodeInfo{
-		PC:      evm.pc,
-		Op:      op,
-		GasCost: GasCosts[op],
+		PC:           evm.pc,
+		Op:           op,
+		GasRemaining: gasRemaining,
+		GasCost:      gasCost,
 	}
 	ctx := &HookContext{
 		State:  NewReadOnlyState(evm.state),

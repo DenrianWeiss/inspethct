@@ -97,7 +97,7 @@ func (e *SimpleEngine) Run(cfg *ExecutionConfig) (*ExecutionResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	res, err := e.runWithFork(state, cfg.Code, cfg.Fork, cfg.Precompiles)
+	res, err := e.runWithConfig(state, cfg)
 	applyBaseFeeBurn(state, cfg, res)
 	return res, err
 }
@@ -106,12 +106,35 @@ func (e *SimpleEngine) RunWithState(state EVMState, code []byte) (*ExecutionResu
 	return e.runWithFork(state, code, ForkLondon, nil)
 }
 
+func (e *SimpleEngine) runWithConfig(state EVMState, cfg *ExecutionConfig) (*ExecutionResult, error) {
+	fork := cfg.Fork
+	if fork == "" {
+		fork = ForkLondon
+	}
+	evm := NewEVM(state, fork, cfg.Precompiles)
+	if cfg.Hooks != nil {
+		evm.SetHooks(cfg.Hooks)
+	}
+	res, err := evm.Run(cfg.Code)
+	if res != nil && cfg.GasLimit >= res.GasRemaining {
+		res.GasUsed = cfg.GasLimit - res.GasRemaining
+	}
+	return res, err
+}
+
 func (e *SimpleEngine) runWithFork(state EVMState, code []byte, fork Fork, precompiles *PrecompileRegistry) (*ExecutionResult, error) {
 	if fork == "" {
 		fork = ForkLondon
 	}
 	evm := NewEVM(state, fork, precompiles)
-	return evm.Run(code)
+	res, err := evm.Run(code)
+	if res != nil {
+		gasLimit := state.GasMeter().Gas() + res.GasUsed
+		if gasLimit >= res.GasRemaining {
+			res.GasUsed = gasLimit - res.GasRemaining
+		}
+	}
+	return res, err
 }
 
 func (e *SimpleEngine) NewState(cfg *ExecutionConfig) (EVMState, error) {
@@ -173,7 +196,11 @@ func (e *SimpleEngine) NewState(cfg *ExecutionConfig) (EVMState, error) {
 		txCtx = &SimpleTxContext{OriginVal: cfg.Origin, GasPriceVal: big.NewInt(0)}
 	}
 
-	return NewEVMState(stack, memory, storage, transientStorage, account, gasMeter, blockCtx, txCtx, contract, accessList), nil
+	state := NewEVMState(stack, memory, storage, transientStorage, account, gasMeter, blockCtx, txCtx, contract, accessList)
+	if concrete, ok := state.(*evmState); ok {
+		concrete.callDepth = cfg.CallDepth
+	}
+	return state, nil
 }
 
 func (e *SimpleEngine) SupportedForks() []Fork {

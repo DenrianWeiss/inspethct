@@ -75,6 +75,8 @@ type OpcodeInfo struct {
 	PC uint64
 	// Op is the opcode byte.
 	Op byte
+	// GasRemaining is the gas left before executing this opcode.
+	GasRemaining uint64
 	// GasCost is the gas cost of this opcode (pre-execution).
 	GasCost uint64
 	// StackPopCount is the number of items this opcode pops.

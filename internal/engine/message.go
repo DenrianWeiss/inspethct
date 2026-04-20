@@ -169,7 +169,7 @@ func (evm *EVM) newChildState(msg *Message) EVMState {
 	// (simplified: just share the same access list instance for correctness)
 	childAccessList = parent.AccessList().(*SimpleAccessList)
 
-	return NewEVMState(
+	childState := NewEVMState(
 		NewStack(),
 		NewMemory(),
 		parent.Storage(),
@@ -181,6 +181,10 @@ func (evm *EVM) newChildState(msg *Message) EVMState {
 		contract,
 		childAccessList,
 	)
+	if concrete, ok := childState.(*evmState); ok {
+		concrete.callDepth = msg.CallDepth
+	}
+	return childState
 }
 
 // opCallCommon handles the common logic for all CALL-family opcodes.
