@@ -22,6 +22,7 @@ const (
 type Config struct {
 	Mode        Mode
 	Fork        engine.Fork
+	ChainIDOverride *big.Int
 	Provider    upstream.Provider
 	Cache       cache.Store
 	Block       upstream.BlockRef
@@ -36,6 +37,7 @@ type CachePolicy struct {
 type Engine struct {
 	mode         Mode
 	fork         engine.Fork
+	chainIDOverride *big.Int
 	provider     upstream.Provider
 	cache        cache.Store
 	block        upstream.BlockRef
@@ -74,6 +76,8 @@ type CallRequest struct {
 	Value    *big.Int
 	GasLimit uint64
 	GasPrice *big.Int
+	BlobGasFeeCap *big.Int
+	BlobHashes []engine.Hash
 	Block    upstream.BlockRef
 }
 
@@ -131,6 +135,7 @@ func New(cfg Config) (*Engine, error) {
 	return &Engine{
 		mode:         mode,
 		fork:         cfg.Fork,
+		chainIDOverride: cloneBigInt(cfg.ChainIDOverride),
 		provider:     cfg.Provider,
 		cache:        store,
 		block:        block.Normalize(),
@@ -149,13 +154,32 @@ func (engineRef *Engine) ResolveBlock(ctx context.Context, ref upstream.BlockRef
 		return upstream.Block{}, err
 	}
 	if block, ok := engineRef.cache.GetBlock(resolvedRef); ok {
-		return block, nil
+		return engineRef.populateBlockChainID(ctx, resolvedRef, block)
 	}
 	block, err := engineRef.provider.GetBlock(ctx, resolvedRef)
 	if err != nil {
 		return upstream.Block{}, err
 	}
-	engineRef.cache.PutBlock(resolvedRef, block)
+	return engineRef.populateBlockChainID(ctx, resolvedRef, block)
+}
+
+func (engineRef *Engine) populateBlockChainID(ctx context.Context, ref upstream.BlockRef, block upstream.Block) (upstream.Block, error) {
+	if block.ChainID != nil {
+		engineRef.cache.PutBlock(ref, block)
+		return block, nil
+	}
+	chainID := cloneBigInt(engineRef.chainIDOverride)
+	if chainID == nil {
+		var err error
+		chainID, err = engineRef.provider.ChainID(ctx)
+		if err != nil {
+			return upstream.Block{}, err
+		}
+	}
+	if chainID != nil {
+		block.ChainID = new(big.Int).Set(chainID)
+	}
+	engineRef.cache.PutBlock(ref, block)
 	return block, nil
 }
 
@@ -205,7 +229,7 @@ func (engineRef *Engine) prepareCallAgainstState(ctx context.Context, req CallRe
 			Caller:           req.From,
 			ContractAddress:  req.To,
 			BlockContext:     newBlockContext(block),
-			TxContext:        newTxContext(req.From, req.GasPrice),
+			TxContext:        newTxContext(req.From, req.GasPrice, req.BlobHashes, req.BlobGasFeeCap),
 			State:            accountState,
 			Storage:          storageState,
 			TransientStorage: engine.NewInMemoryTransientStorage(),
@@ -263,6 +287,8 @@ func (engineRef *Engine) PrepareReplay(ctx context.Context, txHash engine.Hash) 
 		Value:    tx.Value,
 		GasLimit: tx.Gas,
 		GasPrice: tx.GasPrice,
+		BlobGasFeeCap: tx.BlobGasFeeCap,
+		BlobHashes: tx.BlobHashes,
 		Block:    executionBlockRef,
 	}, stateView, replayState)
 	if err != nil {
@@ -439,7 +465,7 @@ func (engineRef *Engine) prepareCreateReplay(ctx context.Context, tx upstream.Tr
 			Caller:           tx.From,
 			ContractAddress:  tx.From,
 			BlockContext:     newBlockContext(block),
-			TxContext:        newTxContext(tx.From, tx.GasPrice),
+			TxContext:        newTxContext(tx.From, tx.GasPrice, tx.BlobHashes, tx.BlobGasFeeCap),
 			State:            accountState,
 			Storage:          storageState,
 			TransientStorage: engine.NewInMemoryTransientStorage(),
@@ -661,7 +687,7 @@ func (engineRef *Engine) prepareReplayTransactionWithState(ctx context.Context, 
 				Caller:           tx.From,
 				ContractAddress:  tx.From,
 				BlockContext:     newBlockContext(block),
-				TxContext:        newTxContext(tx.From, tx.GasPrice),
+				TxContext:        newTxContext(tx.From, tx.GasPrice, tx.BlobHashes, tx.BlobGasFeeCap),
 				State:            accountState,
 				Storage:          storageState,
 				TransientStorage: engine.NewInMemoryTransientStorage(),
@@ -676,6 +702,8 @@ func (engineRef *Engine) prepareReplayTransactionWithState(ctx context.Context, 
 		Value:    tx.Value,
 		GasLimit: tx.Gas,
 		GasPrice: tx.GasPrice,
+		BlobGasFeeCap: tx.BlobGasFeeCap,
+		BlobHashes: tx.BlobHashes,
 		Block:    executionBlockRef,
 	}, stateView, replayState)
 }

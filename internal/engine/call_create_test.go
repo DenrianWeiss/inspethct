@@ -122,6 +122,83 @@ func TestCallWithValue(t *testing.T) {
 	}
 }
 
+func TestRunCreditsTopLevelCallValueBeforeExecution(t *testing.T) {
+	code := []byte{0x47, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3}
+	caller := Address{0x11}
+	contractAddr := Address{0x42}
+	account := NewInMemoryAccountState()
+	account.SetBalance(caller, big.NewInt(1000))
+	account.SetCode(contractAddr, code)
+	runner := NewSimpleEngine()
+	result, err := runner.Run(&ExecutionConfig{
+		Fork:            ForkLondon,
+		GasLimit:        100000,
+		Value:           big.NewInt(123),
+		Input:           nil,
+		Origin:          caller,
+		Caller:          caller,
+		ContractAddress: contractAddr,
+		Code:            code,
+		CodeHash:        hashCode(code),
+		State:           account,
+		Storage:         NewInMemoryStorage(),
+		BlockContext:    &SimpleBlockContext{NumberVal: big.NewInt(1), ChainIDVal: big.NewInt(1)},
+		TxContext:       &SimpleTxContext{OriginVal: caller, GasPriceVal: big.NewInt(0)},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result == nil || result.Status != StatusSuccess {
+		t.Fatalf("result = %#v, want success", result)
+	}
+	if len(result.ReturnData) != 32 || new(big.Int).SetBytes(result.ReturnData).Cmp(big.NewInt(123)) != 0 {
+		t.Fatalf("returnData = %x, want selfbalance 123", result.ReturnData)
+	}
+	if account.Balance(caller).Cmp(big.NewInt(877)) != 0 {
+		t.Fatalf("caller balance = %v, want 877", account.Balance(caller))
+	}
+	if account.Balance(contractAddr).Cmp(big.NewInt(123)) != 0 {
+		t.Fatalf("contract balance = %v, want 123", account.Balance(contractAddr))
+	}
+}
+
+func TestRunRevertsTopLevelCallValueOnFailure(t *testing.T) {
+	code := []byte{0x60, 0x00, 0x60, 0x00, 0xFD}
+	caller := Address{0x11}
+	contractAddr := Address{0x42}
+	account := NewInMemoryAccountState()
+	account.SetBalance(caller, big.NewInt(1000))
+	account.SetCode(contractAddr, code)
+	runner := NewSimpleEngine()
+	result, err := runner.Run(&ExecutionConfig{
+		Fork:            ForkLondon,
+		GasLimit:        100000,
+		Value:           big.NewInt(123),
+		Input:           nil,
+		Origin:          caller,
+		Caller:          caller,
+		ContractAddress: contractAddr,
+		Code:            code,
+		CodeHash:        hashCode(code),
+		State:           account,
+		Storage:         NewInMemoryStorage(),
+		BlockContext:    &SimpleBlockContext{NumberVal: big.NewInt(1), ChainIDVal: big.NewInt(1)},
+		TxContext:       &SimpleTxContext{OriginVal: caller, GasPriceVal: big.NewInt(0)},
+	})
+	if err == nil {
+		t.Fatalf("Run() error = nil, want execution reverted")
+	}
+	if result == nil || result.Status != StatusRevert {
+		t.Fatalf("result = %#v, want revert", result)
+	}
+	if account.Balance(caller).Cmp(big.NewInt(1000)) != 0 {
+		t.Fatalf("caller balance = %v, want 1000 after revert", account.Balance(caller))
+	}
+	if account.Balance(contractAddr).Sign() != 0 {
+		t.Fatalf("contract balance = %v, want 0 after revert", account.Balance(contractAddr))
+	}
+}
+
 // TestCallDepthLimit verifies failure at 1024 depth.
 func TestCallDepthLimit(t *testing.T) {
 	// Recursive self-call: CALL(gas=0xFFFF, self, value=0, in=0,0, out=0,0)

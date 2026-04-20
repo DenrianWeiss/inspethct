@@ -11,7 +11,7 @@ func opLog(evm *EVM, nTopics int) error {
 		t := evm.stack.Pop()
 		topics[i] = WordToHash(t)
 	}
-	data := evm.memory.Get(offset, size)
+	data := append([]byte(nil), evm.memory.Get(offset, size)...)
 	log := Log{
 		Address: evm.state.Contract().Address(),
 		Topics:  topics,

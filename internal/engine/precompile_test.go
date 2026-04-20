@@ -1,6 +1,10 @@
 package engine
 
-import "testing"
+import (
+	"bytes"
+	"encoding/hex"
+	"testing"
+)
 
 func TestMainnetPrecompilesByFork(t *testing.T) {
 	if _, ok := MainnetPrecompilesForFork(ForkLondon).Resolve(precompileAddress(0x0a)); ok {
@@ -48,5 +52,27 @@ func TestEmbeddedKZGContextLoads(t *testing.T) {
 	}
 	if ctx == nil {
 		t.Fatalf("embedded kzg context is nil")
+	}
+}
+
+func TestRunECRecoverMatchesMainnetVector(t *testing.T) {
+	inputHex := "ee8f543390b5647e7774898d06db49a45323d918bb96a24df6943ae3cb6a0807" +
+		"000000000000000000000000000000000000000000000000000000000000001c" +
+		"977cd7acc7e4837f5afe54f395b276fad8c4144a738d4d817c0a88d9d4b91144" +
+		"5dcde20164af184639b85fb80d9f8cc6e65fb80640328fc69236982b7dc07f25"
+	input, err := hex.DecodeString(inputHex)
+	if err != nil {
+		t.Fatalf("hex.DecodeString() error = %v", err)
+	}
+	want, err := hex.DecodeString("00000000000000000000000057ed531a9da5b77c504cfd9b1c76b49e8dd76d05")
+	if err != nil {
+		t.Fatalf("hex.DecodeString() want error = %v", err)
+	}
+	got, err := runECRecover(input, ForkCancun)
+	if err != nil {
+		t.Fatalf("runECRecover() error = %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("runECRecover() = %x, want %x", got, want)
 	}
 }

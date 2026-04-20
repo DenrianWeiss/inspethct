@@ -136,7 +136,7 @@ func TestJSONRPCProviderParsesChainAndTraceMethods(t *testing.T) {
 		case "debug_traceTransaction":
 			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"gas":21000,"failed":false}}`))
 		case "eth_getBlockByNumber":
-			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"transactions":[{"hash":"0x0100000000000000000000000000000000000000000000000000000000000000","blockHash":"0x0200000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","from":"0x0000000000000000000000000000000000000001","to":"0x0000000000000000000000000000000000000002","gas":"0x5208","gasPrice":"0x1","input":"0x","nonce":"0x0","transactionIndex":"0x0","value":"0x0"}]}}`))
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"number":"0x1","hash":"0x0300000000000000000000000000000000000000000000000000000000000000","parentHash":"0x0400000000000000000000000000000000000000000000000000000000000000","timestamp":"0x5","gasLimit":"0x1c9c380","baseFeePerGas":"0x10","blobBaseFeePerGas":"0x20","miner":"0x0000000000000000000000000000000000000003","mixHash":"0x0500000000000000000000000000000000000000000000000000000000000000","transactions":[{"hash":"0x0100000000000000000000000000000000000000000000000000000000000000","blockHash":"0x0200000000000000000000000000000000000000000000000000000000000000","blockNumber":"0x1","from":"0x0000000000000000000000000000000000000001","to":"0x0000000000000000000000000000000000000002","type":"0x3","gas":"0x5208","gasPrice":"0x1","maxFeePerBlobGas":"0x7","blobVersionedHashes":["0x0600000000000000000000000000000000000000000000000000000000000000"],"input":"0x","nonce":"0x0","transactionIndex":"0x0","value":"0x0"}]}}`))
 		default:
 			w.WriteHeader(http.StatusBadRequest)
 		}
@@ -170,5 +170,21 @@ func TestJSONRPCProviderParsesChainAndTraceMethods(t *testing.T) {
 	}
 	if len(transactions) != 1 {
 		t.Fatalf("len(transactions) = %d, want 1", len(transactions))
+	}
+	if transactions[0].Type != 3 {
+		t.Fatalf("transactions[0].Type = %d, want 3", transactions[0].Type)
+	}
+	if transactions[0].BlobGasFeeCap == nil || transactions[0].BlobGasFeeCap.Uint64() != 7 {
+		t.Fatalf("transactions[0].BlobGasFeeCap = %v, want 7", transactions[0].BlobGasFeeCap)
+	}
+	if len(transactions[0].BlobHashes) != 1 {
+		t.Fatalf("len(transactions[0].BlobHashes) = %d, want 1", len(transactions[0].BlobHashes))
+	}
+	block, err := provider.GetBlock(context.Background(), BlockNumber(1))
+	if err != nil {
+		t.Fatalf("GetBlock() error = %v", err)
+	}
+	if block.BlobBaseFee == nil || block.BlobBaseFee.Uint64() != 32 {
+		t.Fatalf("block.BlobBaseFee = %v, want 32", block.BlobBaseFee)
 	}
 }

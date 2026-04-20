@@ -12,6 +12,7 @@ import (
 
 type stubProvider struct {
 	blockCalls        int
+	chainID           *big.Int
 	block             upstream.Block
 	balanceByAddress  map[engine.Address]*big.Int
 	nonceByAddress    map[engine.Address]uint64
@@ -23,6 +24,9 @@ type stubProvider struct {
 }
 
 func (provider *stubProvider) ChainID(ctx context.Context) (*big.Int, error) {
+	if provider.chainID != nil {
+		return new(big.Int).Set(provider.chainID), nil
+	}
 	return big.NewInt(1), nil
 }
 
@@ -99,8 +103,45 @@ func TestResolveBlockUsesCache(t *testing.T) {
 	}
 }
 
+func TestResolveBlockPopulatesChainID(t *testing.T) {
+	provider := &stubProvider{block: upstream.Block{Number: big.NewInt(9)}, chainID: big.NewInt(1)}
+	engineRef, err := New(Config{Mode: ModePinned, Provider: provider, Block: upstream.BlockNumber(9)})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	block, err := engineRef.ResolveBlock(context.Background(), upstream.BlockRef{})
+	if err != nil {
+		t.Fatalf("ResolveBlock() error = %v", err)
+	}
+	if block.ChainID == nil || block.ChainID.Uint64() != 1 {
+		t.Fatalf("block.ChainID = %v, want 1", block.ChainID)
+	}
+	cached, err := engineRef.ResolveBlock(context.Background(), upstream.BlockRef{})
+	if err != nil {
+		t.Fatalf("ResolveBlock() cached error = %v", err)
+	}
+	if cached.ChainID == nil || cached.ChainID.Uint64() != 1 {
+		t.Fatalf("cached.ChainID = %v, want 1", cached.ChainID)
+	}
+}
+
+func TestResolveBlockUsesChainIDOverride(t *testing.T) {
+	provider := &stubProvider{block: upstream.Block{Number: big.NewInt(9)}, chainID: big.NewInt(1)}
+	engineRef, err := New(Config{Mode: ModePinned, Provider: provider, Block: upstream.BlockNumber(9), ChainIDOverride: big.NewInt(10)})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	block, err := engineRef.ResolveBlock(context.Background(), upstream.BlockRef{})
+	if err != nil {
+		t.Fatalf("ResolveBlock() error = %v", err)
+	}
+	if block.ChainID == nil || block.ChainID.Uint64() != 10 {
+		t.Fatalf("block.ChainID = %v, want 10", block.ChainID)
+	}
+}
+
 func TestPrepareCallBuildsOverlayAndConfig(t *testing.T) {
-	provider := &stubProvider{block: upstream.Block{Number: big.NewInt(1)}}
+	provider := &stubProvider{block: upstream.Block{Number: big.NewInt(1)}, chainID: big.NewInt(11155111)}
 	engineRef, err := New(Config{Provider: provider, Block: upstream.LatestBlock(), Fork: engine.ForkLondon})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
@@ -132,6 +173,9 @@ func TestPrepareCallBuildsOverlayAndConfig(t *testing.T) {
 	}
 	if prepared.Config.BlockContext.Number().Cmp(big.NewInt(1)) != 0 {
 		t.Fatalf("prepared block number = %s, want 1", prepared.Config.BlockContext.Number().String())
+	}
+	if prepared.Config.BlockContext.ChainID().Cmp(big.NewInt(11155111)) != 0 {
+		t.Fatalf("prepared chain id = %s, want 11155111", prepared.Config.BlockContext.ChainID().String())
 	}
 	if prepared.BlockRef.Tag != upstream.BlockTagLatest {
 		t.Fatalf("prepared block ref = %#v, want latest", prepared.BlockRef)
@@ -224,8 +268,11 @@ func TestPrepareReplayBuildsCallFromTransaction(t *testing.T) {
 				BlockNumber: big.NewInt(12),
 				From:        engine.Address{0x01},
 				To:          &to,
+				Type:        3,
 				Gas:         55000,
 				GasPrice:    big.NewInt(17),
+				BlobGasFeeCap: big.NewInt(23),
+				BlobHashes:  []engine.Hash{{0xaa}},
 				Input:       []byte{0xde, 0xad},
 				Value:       big.NewInt(9),
 			},
@@ -247,6 +294,12 @@ func TestPrepareReplayBuildsCallFromTransaction(t *testing.T) {
 	}
 	if prepared.Config.TxContext.GasPrice().Cmp(big.NewInt(17)) != 0 {
 		t.Fatalf("prepared gas price = %s, want 17", prepared.Config.TxContext.GasPrice().String())
+	}
+	if prepared.Config.TxContext.BlobGasFee().Cmp(big.NewInt(23)) != 0 {
+		t.Fatalf("prepared blob gas fee = %s, want 23", prepared.Config.TxContext.BlobGasFee().String())
+	}
+	if len(prepared.Config.TxContext.BlobHashes()) != 1 {
+		t.Fatalf("prepared blob hashes = %d, want 1", len(prepared.Config.TxContext.BlobHashes()))
 	}
 	if tx.Hash != txHash || receipt.TransactionHash != txHash {
 		t.Fatalf("replay tx/receipt hash mismatch")

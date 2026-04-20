@@ -175,3 +175,17 @@ func TestCompareReplayToReceiptMatchesStatusGasAndLogs(t *testing.T) {
 		t.Fatalf("comparison.Match = false, mismatch = %#v", comparison.FirstMismatch)
 	}
 }
+
+func TestReplayGasUsedAppliesRefundCap(t *testing.T) {
+	input := make([]byte, 229)
+	for index := 0; index < 227; index++ {
+		input[index] = 0xaa
+	}
+	tx := upstream.Transaction{Input: input}
+	result := &engine.ExecutionResult{GasUsed: 366579, GasRefund: 79600}
+
+	gasUsed := replayGasUsed(tx, result)
+	if gasUsed != 312976 {
+		t.Fatalf("gasUsed = %d, want 312976", gasUsed)
+	}
+}

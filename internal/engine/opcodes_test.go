@@ -521,6 +521,39 @@ func TestOpcodeLog(t *testing.T) {
 	}
 }
 
+func TestOpcodeLogCopiesDataSnapshot(t *testing.T) {
+	code := []byte{
+		0x60, 0x01, 0x60, 0x00, 0x52,
+		0x60, 0x00,
+		0x60, 0x20,
+		0x60, 0x00,
+		0xA1,
+		0x60, 0x02, 0x60, 0x00, 0x52,
+		0x00,
+	}
+	evm, state := makeTestEVM(code)
+	res, err := evm.Run(code)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Status != StatusSuccess {
+		t.Fatalf("expected success, got %v", res.Status)
+	}
+	logs := (*state).Logs()
+	if len(logs) != 1 {
+		t.Fatalf("expected 1 log, got %d", len(logs))
+	}
+	if len(logs[0].Data) != 32 {
+		t.Fatalf("expected 32 bytes of log data, got %d", len(logs[0].Data))
+	}
+	if logs[0].Data[31] != 0x01 {
+		t.Fatalf("expected log snapshot to keep original word, got %x", logs[0].Data)
+	}
+	if word := evm.memory.Word(0); word[31] != 0x02 {
+		t.Fatalf("expected memory to be updated after log emission, got %x", word)
+	}
+}
+
 func TestOpcodeStaticCallWriteProtection(t *testing.T) {
 	code := []byte{0x60, 0x01, 0x60, 0x00, 0x55, 0x00}
 	evm, _ := makeTestEVM(code)

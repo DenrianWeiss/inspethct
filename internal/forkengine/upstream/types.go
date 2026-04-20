@@ -137,8 +137,11 @@ type Transaction struct {
 	BlockNumber      *big.Int
 	From             engine.Address
 	To               *engine.Address
+	Type             uint64
 	Gas              uint64
 	GasPrice         *big.Int
+	BlobGasFeeCap    *big.Int
+	BlobHashes       []engine.Hash
 	Input            []byte
 	Nonce            uint64
 	TransactionIndex *uint64
@@ -156,6 +159,12 @@ func (tx Transaction) Clone() Transaction {
 	}
 	if tx.GasPrice != nil {
 		clone.GasPrice = new(big.Int).Set(tx.GasPrice)
+	}
+	if tx.BlobGasFeeCap != nil {
+		clone.BlobGasFeeCap = new(big.Int).Set(tx.BlobGasFeeCap)
+	}
+	if tx.BlobHashes != nil {
+		clone.BlobHashes = append([]engine.Hash(nil), tx.BlobHashes...)
 	}
 	if tx.Input != nil {
 		clone.Input = append([]byte(nil), tx.Input...)

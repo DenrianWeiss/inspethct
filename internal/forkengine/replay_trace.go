@@ -463,7 +463,13 @@ func replayGasUsed(tx upstream.Transaction, result *engine.ExecutionResult) uint
 			intrinsic += 16
 		}
 	}
-	return intrinsic + result.GasUsed
+	spent := intrinsic + result.GasUsed
+	refund := result.GasRefund
+	refundCap := spent / 5
+	if refund > refundCap {
+		refund = refundCap
+	}
+	return spent - refund
 }
 
 func equalTopics(left []engine.Hash, right []engine.Hash) bool {

@@ -293,7 +293,7 @@ type rpcBlock struct {
 	Timestamp   string `json:"timestamp"`
 	GasLimit    string `json:"gasLimit"`
 	BaseFee     string `json:"baseFeePerGas"`
-	BlobBaseFee string `json:"blobGasUsedRatio"`
+	BlobBaseFee string `json:"blobBaseFeePerGas"`
 	Miner       string `json:"miner"`
 	PrevRandao  string `json:"mixHash"`
 }
@@ -308,8 +308,11 @@ type rpcTransaction struct {
 	BlockNumber      string  `json:"blockNumber"`
 	From             string  `json:"from"`
 	To               *string `json:"to"`
+	Type             string  `json:"type"`
 	Gas              string  `json:"gas"`
 	GasPrice         string  `json:"gasPrice"`
+	BlobGasFeeCap    string  `json:"maxFeePerBlobGas"`
+	BlobHashes       []string `json:"blobVersionedHashes"`
 	Input            string  `json:"input"`
 	Nonce            string  `json:"nonce"`
 	TransactionIndex *string `json:"transactionIndex"`
@@ -363,6 +366,10 @@ func (block rpcBlock) intoBlock() (Block, error) {
 	if err != nil {
 		return Block{}, err
 	}
+	blobBaseFee, err := parseOptionalHexBig(block.BlobBaseFee)
+	if err != nil {
+		return Block{}, err
+	}
 	coinbase, err := parseAddress(block.Miner)
 	if err != nil {
 		return Block{}, err
@@ -371,7 +378,7 @@ func (block rpcBlock) intoBlock() (Block, error) {
 	if err != nil {
 		return Block{}, err
 	}
-	return Block{Number: number, Hash: hash, ParentHash: parentHash, Timestamp: timestamp, GasLimit: gasLimit, BaseFee: baseFee, Coinbase: coinbase, PrevRandao: prevRandao}, nil
+	return Block{Number: number, Hash: hash, ParentHash: parentHash, Timestamp: timestamp, GasLimit: gasLimit, BaseFee: baseFee, BlobBaseFee: blobBaseFee, Coinbase: coinbase, PrevRandao: prevRandao}, nil
 }
 
 func (tx rpcTransaction) intoTransaction() (Transaction, error) {
@@ -395,11 +402,23 @@ func (tx rpcTransaction) intoTransaction() (Transaction, error) {
 	if err != nil {
 		return Transaction{}, err
 	}
+	txType, err := parseOptionalHexUint64Value(tx.Type)
+	if err != nil {
+		return Transaction{}, err
+	}
 	gas, err := parseHexUint64(tx.Gas)
 	if err != nil {
 		return Transaction{}, err
 	}
 	gasPrice, err := parseHexBig(tx.GasPrice)
+	if err != nil {
+		return Transaction{}, err
+	}
+	blobGasFeeCap, err := parseOptionalHexBig(tx.BlobGasFeeCap)
+	if err != nil {
+		return Transaction{}, err
+	}
+	blobHashes, err := parseHashList(tx.BlobHashes)
 	if err != nil {
 		return Transaction{}, err
 	}
@@ -419,7 +438,7 @@ func (tx rpcTransaction) intoTransaction() (Transaction, error) {
 	if err != nil {
 		return Transaction{}, err
 	}
-	return Transaction{Hash: hash, BlockHash: blockHash, BlockNumber: blockNumber, From: from, To: to, Gas: gas, GasPrice: gasPrice, Input: input, Nonce: nonce, TransactionIndex: index, Value: value}, nil
+	return Transaction{Hash: hash, BlockHash: blockHash, BlockNumber: blockNumber, From: from, To: to, Type: txType, Gas: gas, GasPrice: gasPrice, BlobGasFeeCap: blobGasFeeCap, BlobHashes: blobHashes, Input: input, Nonce: nonce, TransactionIndex: index, Value: value}, nil
 }
 
 func (receipt rpcReceipt) intoReceipt() (Receipt, error) {
@@ -825,6 +844,13 @@ func parseOptionalHexUint64(input *string) (*uint64, error) {
 	return &copyValue, nil
 }
 
+func parseOptionalHexUint64Value(input string) (uint64, error) {
+	if strings.TrimSpace(input) == "" || strings.TrimSpace(input) == "null" {
+		return 0, nil
+	}
+	return parseHexUint64(input)
+}
+
 func parseHexBytes(input string) ([]byte, error) {
 	trimmed := strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(input), "0x"), "0X")
 	if trimmed == "" {
@@ -851,6 +877,21 @@ func parseHash(input string) (engine.Hash, error) {
 	var hash engine.Hash
 	copy(hash[:], decoded)
 	return hash, nil
+}
+
+func parseHashList(inputs []string) ([]engine.Hash, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	hashes := make([]engine.Hash, 0, len(inputs))
+	for _, input := range inputs {
+		hash, err := parseHash(input)
+		if err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, hash)
+	}
+	return hashes, nil
 }
 
 func parseOptionalHash(input string) (engine.Hash, error) {

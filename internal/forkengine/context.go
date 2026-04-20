@@ -66,24 +66,29 @@ func (ctx *forkBlockContext) ChainID() *big.Int {
 }
 
 type forkTxContext struct {
-	origin   engine.Address
-	gasPrice *big.Int
+	origin     engine.Address
+	gasPrice   *big.Int
+	blobHashes []engine.Hash
+	blobGasFee *big.Int
 }
 
-func newTxContext(origin engine.Address, gasPrice *big.Int) engine.TxContext {
+func newTxContext(origin engine.Address, gasPrice *big.Int, blobHashes []engine.Hash, blobGasFee *big.Int) engine.TxContext {
 	if gasPrice == nil {
 		gasPrice = big.NewInt(0)
 	}
-	return &forkTxContext{origin: origin, gasPrice: new(big.Int).Set(gasPrice)}
+	if blobGasFee == nil {
+		blobGasFee = big.NewInt(0)
+	}
+	return &forkTxContext{origin: origin, gasPrice: new(big.Int).Set(gasPrice), blobHashes: append([]engine.Hash(nil), blobHashes...), blobGasFee: new(big.Int).Set(blobGasFee)}
 }
 
 func (ctx *forkTxContext) Origin() engine.Address    { return ctx.origin }
-func (ctx *forkTxContext) BlobHashes() []engine.Hash { return nil }
+func (ctx *forkTxContext) BlobHashes() []engine.Hash { return append([]engine.Hash(nil), ctx.blobHashes...) }
 
 func (ctx *forkTxContext) GasPrice() *big.Int {
 	return new(big.Int).Set(ctx.gasPrice)
 }
 
 func (ctx *forkTxContext) BlobGasFee() *big.Int {
-	return big.NewInt(0)
+	return new(big.Int).Set(ctx.blobGasFee)
 }

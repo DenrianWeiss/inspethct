@@ -97,9 +97,44 @@ func (e *SimpleEngine) Run(cfg *ExecutionConfig) (*ExecutionResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	accSnap, stoSnap, result := applyTopLevelCallValue(state, cfg)
+	if result != nil {
+		return result, nil
+	}
 	res, err := e.runWithConfig(state, cfg)
+	revertTopLevelCallValue(state, accSnap, stoSnap, res)
 	applyBaseFeeBurn(state, cfg, res)
 	return res, err
+}
+
+
+func applyTopLevelCallValue(state EVMState, cfg *ExecutionConfig) (int, int, *ExecutionResult) {
+	if state == nil || cfg == nil || cfg.Value == nil || cfg.Value.Sign() == 0 {
+		return -1, -1, nil
+	}
+	if cfg.Caller == cfg.ContractAddress {
+		return -1, -1, nil
+	}
+	account := state.Account()
+	if account.Balance(cfg.Caller).Cmp(cfg.Value) < 0 {
+		return -1, -1, &ExecutionResult{Status: StatusInsufficientBalance, GasRemaining: cfg.GasLimit}
+	}
+	accSnap := account.Snapshot()
+	stoSnap := state.Storage().Snapshot()
+	account.SubBalance(cfg.Caller, cfg.Value)
+	account.AddBalance(cfg.ContractAddress, cfg.Value)
+	return accSnap, stoSnap, nil
+}
+
+func revertTopLevelCallValue(state EVMState, accSnap int, stoSnap int, result *ExecutionResult) {
+	if state == nil || accSnap < 0 || stoSnap < 0 {
+		return
+	}
+	if result != nil && result.Status == StatusSuccess {
+		return
+	}
+	state.Account().RevertToSnapshot(accSnap)
+	state.Storage().RevertToSnapshot(stoSnap)
 }
 
 func (e *SimpleEngine) RunWithState(state EVMState, code []byte) (*ExecutionResult, error) {
