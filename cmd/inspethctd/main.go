@@ -9,9 +9,9 @@ import (
 	"strings"
 
 	"inspethct/internal/engine"
-	jsonrpcserver "inspethct/internal/jsonrpc"
 	"inspethct/internal/forkengine"
 	"inspethct/internal/forkengine/upstream"
+	jsonrpcserver "inspethct/internal/jsonrpc"
 )
 
 func main() {

@@ -20,13 +20,13 @@ const (
 )
 
 type Config struct {
-	Mode        Mode
-	Fork        engine.Fork
+	Mode            Mode
+	Fork            engine.Fork
 	ChainIDOverride *big.Int
-	Provider    upstream.Provider
-	Cache       cache.Store
-	Block       upstream.BlockRef
-	CachePolicy CachePolicy
+	Provider        upstream.Provider
+	Cache           cache.Store
+	Block           upstream.BlockRef
+	CachePolicy     CachePolicy
 }
 
 type CachePolicy struct {
@@ -35,14 +35,14 @@ type CachePolicy struct {
 }
 
 type Engine struct {
-	mode         Mode
-	fork         engine.Fork
+	mode            Mode
+	fork            engine.Fork
 	chainIDOverride *big.Int
-	provider     upstream.Provider
-	cache        cache.Store
-	block        upstream.BlockRef
-	cachePolicy  CachePolicy
-	replayStates map[string]ReplayState
+	provider        upstream.Provider
+	cache           cache.Store
+	block           upstream.BlockRef
+	cachePolicy     CachePolicy
+	replayStates    map[string]ReplayState
 }
 
 type ReplayState struct {
@@ -70,15 +70,15 @@ type StateRequest struct {
 }
 
 type CallRequest struct {
-	From     engine.Address
-	To       engine.Address
-	Input    []byte
-	Value    *big.Int
-	GasLimit uint64
-	GasPrice *big.Int
+	From          engine.Address
+	To            engine.Address
+	Input         []byte
+	Value         *big.Int
+	GasLimit      uint64
+	GasPrice      *big.Int
 	BlobGasFeeCap *big.Int
-	BlobHashes []engine.Hash
-	Block    upstream.BlockRef
+	BlobHashes    []engine.Hash
+	Block         upstream.BlockRef
 }
 
 type PreparedCall struct {
@@ -133,14 +133,14 @@ func New(cfg Config) (*Engine, error) {
 		store = cache.NewMemoryStore()
 	}
 	return &Engine{
-		mode:         mode,
-		fork:         cfg.Fork,
+		mode:            mode,
+		fork:            cfg.Fork,
 		chainIDOverride: cloneBigInt(cfg.ChainIDOverride),
-		provider:     cfg.Provider,
-		cache:        store,
-		block:        block.Normalize(),
-		cachePolicy:  policy,
-		replayStates: make(map[string]ReplayState),
+		provider:        cfg.Provider,
+		cache:           store,
+		block:           block.Normalize(),
+		cachePolicy:     policy,
+		replayStates:    make(map[string]ReplayState),
 	}, nil
 }
 
@@ -281,15 +281,15 @@ func (engineRef *Engine) PrepareReplay(ctx context.Context, txHash engine.Hash) 
 		return nil, upstream.Transaction{}, upstream.Receipt{}, err
 	}
 	prepared, err := engineRef.prepareCallAgainstState(ctx, CallRequest{
-		From:     tx.From,
-		To:       *tx.To,
-		Input:    tx.Input,
-		Value:    tx.Value,
-		GasLimit: tx.Gas,
-		GasPrice: tx.GasPrice,
+		From:          tx.From,
+		To:            *tx.To,
+		Input:         tx.Input,
+		Value:         tx.Value,
+		GasLimit:      tx.Gas,
+		GasPrice:      tx.GasPrice,
 		BlobGasFeeCap: tx.BlobGasFeeCap,
-		BlobHashes: tx.BlobHashes,
-		Block:    executionBlockRef,
+		BlobHashes:    tx.BlobHashes,
+		Block:         executionBlockRef,
 	}, stateView, replayState)
 	if err != nil {
 		return nil, upstream.Transaction{}, upstream.Receipt{}, err
@@ -696,15 +696,15 @@ func (engineRef *Engine) prepareReplayTransactionWithState(ctx context.Context, 
 		}, nil
 	}
 	return engineRef.prepareCallAgainstState(ctx, CallRequest{
-		From:     tx.From,
-		To:       *tx.To,
-		Input:    tx.Input,
-		Value:    tx.Value,
-		GasLimit: tx.Gas,
-		GasPrice: tx.GasPrice,
+		From:          tx.From,
+		To:            *tx.To,
+		Input:         tx.Input,
+		Value:         tx.Value,
+		GasLimit:      tx.Gas,
+		GasPrice:      tx.GasPrice,
 		BlobGasFeeCap: tx.BlobGasFeeCap,
-		BlobHashes: tx.BlobHashes,
-		Block:    executionBlockRef,
+		BlobHashes:    tx.BlobHashes,
+		Block:         executionBlockRef,
 	}, stateView, replayState)
 }
 

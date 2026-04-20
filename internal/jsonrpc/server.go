@@ -25,14 +25,14 @@ type Server struct {
 }
 
 type ReplaySession struct {
-	ID         string                          `json:"id"`
-	TargetTx   string                          `json:"targetTx"`
-	Exact      bool                            `json:"exact"`
-	Limitation string                          `json:"limitation,omitempty"`
-	Position   int                             `json:"position"`
-	Done       bool                            `json:"done"`
-	Result     *engine.ExecutionResult         `json:"result,omitempty"`
-	Trace      []forkengine.ReplayTraceStep    `json:"trace"`
+	ID         string                       `json:"id"`
+	TargetTx   string                       `json:"targetTx"`
+	Exact      bool                         `json:"exact"`
+	Limitation string                       `json:"limitation,omitempty"`
+	Position   int                          `json:"position"`
+	Done       bool                         `json:"done"`
+	Result     *engine.ExecutionResult      `json:"result,omitempty"`
+	Trace      []forkengine.ReplayTraceStep `json:"trace"`
 }
 
 type request struct {
@@ -43,10 +43,10 @@ type request struct {
 }
 
 type response struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      any         `json:"id,omitempty"`
-	Result  any         `json:"result,omitempty"`
-	Error   *respError  `json:"error,omitempty"`
+	JSONRPC string     `json:"jsonrpc"`
+	ID      any        `json:"id,omitempty"`
+	Result  any        `json:"result,omitempty"`
+	Error   *respError `json:"error,omitempty"`
 }
 
 type respError struct {
@@ -233,14 +233,14 @@ func (server *Server) sessionState(sessionID string) (any, *respError) {
 
 func (server *Server) describeSession(session *ReplaySession) map[string]any {
 	state := map[string]any{
-		"id":         session.ID,
-		"targetTx":   session.TargetTx,
-		"exact":      session.Exact,
-		"limitation": session.Limitation,
-		"position":   session.Position,
-		"done":       session.Done,
+		"id":          session.ID,
+		"targetTx":    session.TargetTx,
+		"exact":       session.Exact,
+		"limitation":  session.Limitation,
+		"position":    session.Position,
+		"done":        session.Done,
 		"traceLength": len(session.Trace),
-		"result":     encodeExecutionResult(session.Result),
+		"result":      encodeExecutionResult(session.Result),
 	}
 	if session.Position >= 0 && session.Position < len(session.Trace) {
 		state["currentStep"] = session.Trace[session.Position]

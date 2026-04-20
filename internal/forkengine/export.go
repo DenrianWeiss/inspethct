@@ -10,20 +10,20 @@ import (
 )
 
 type ExportBundle struct {
-	Snapshot     ExportedSnapshot     `json:"snapshot"`
-	ReplayReport *ReplayExportReport  `json:"replayReport,omitempty"`
+	Snapshot     ExportedSnapshot    `json:"snapshot"`
+	ReplayReport *ReplayExportReport `json:"replayReport,omitempty"`
 }
 
 type ReplayExportReport struct {
-	TargetTransactionHash    string                 `json:"targetTransactionHash"`
-	ExecutionBlockRef        string                 `json:"executionBlockRef"`
-	StateSourceBlockRef      string                 `json:"stateSourceBlockRef"`
-	Exact                    bool                   `json:"exact"`
-	Limitation               string                 `json:"limitation,omitempty"`
-	AppliedPriorTransactions []string               `json:"appliedPriorTransactions"`
-	PriorTransactions        []ReplayCheckReport    `json:"priorTransactions"`
-	FirstMismatch            *ReplayCheckReport     `json:"firstMismatch,omitempty"`
-	BlobSuspicion            bool                   `json:"blobSuspicion"`
+	TargetTransactionHash    string              `json:"targetTransactionHash"`
+	ExecutionBlockRef        string              `json:"executionBlockRef"`
+	StateSourceBlockRef      string              `json:"stateSourceBlockRef"`
+	Exact                    bool                `json:"exact"`
+	Limitation               string              `json:"limitation,omitempty"`
+	AppliedPriorTransactions []string            `json:"appliedPriorTransactions"`
+	PriorTransactions        []ReplayCheckReport `json:"priorTransactions"`
+	FirstMismatch            *ReplayCheckReport  `json:"firstMismatch,omitempty"`
+	BlobSuspicion            bool                `json:"blobSuspicion"`
 }
 
 type ReplayCheckReport struct {
@@ -34,7 +34,7 @@ type ReplayCheckReport struct {
 	BlobHashCount    int            `json:"blobHashCount"`
 	BlobGasFeeCap    string         `json:"blobGasFeeCap,omitempty"`
 	Match            bool           `json:"match"`
-	Mismatch         *TraceMismatch  `json:"mismatch,omitempty"`
+	Mismatch         *TraceMismatch `json:"mismatch,omitempty"`
 }
 
 type ReplayLocalTrace struct {

@@ -82,8 +82,10 @@ func newTxContext(origin engine.Address, gasPrice *big.Int, blobHashes []engine.
 	return &forkTxContext{origin: origin, gasPrice: new(big.Int).Set(gasPrice), blobHashes: append([]engine.Hash(nil), blobHashes...), blobGasFee: new(big.Int).Set(blobGasFee)}
 }
 
-func (ctx *forkTxContext) Origin() engine.Address    { return ctx.origin }
-func (ctx *forkTxContext) BlobHashes() []engine.Hash { return append([]engine.Hash(nil), ctx.blobHashes...) }
+func (ctx *forkTxContext) Origin() engine.Address { return ctx.origin }
+func (ctx *forkTxContext) BlobHashes() []engine.Hash {
+	return append([]engine.Hash(nil), ctx.blobHashes...)
+}
 
 func (ctx *forkTxContext) GasPrice() *big.Int {
 	return new(big.Int).Set(ctx.gasPrice)

@@ -303,20 +303,20 @@ type rpcBlockWithTransactions struct {
 }
 
 type rpcTransaction struct {
-	Hash             string  `json:"hash"`
-	BlockHash        string  `json:"blockHash"`
-	BlockNumber      string  `json:"blockNumber"`
-	From             string  `json:"from"`
-	To               *string `json:"to"`
-	Type             string  `json:"type"`
-	Gas              string  `json:"gas"`
-	GasPrice         string  `json:"gasPrice"`
-	BlobGasFeeCap    string  `json:"maxFeePerBlobGas"`
+	Hash             string   `json:"hash"`
+	BlockHash        string   `json:"blockHash"`
+	BlockNumber      string   `json:"blockNumber"`
+	From             string   `json:"from"`
+	To               *string  `json:"to"`
+	Type             string   `json:"type"`
+	Gas              string   `json:"gas"`
+	GasPrice         string   `json:"gasPrice"`
+	BlobGasFeeCap    string   `json:"maxFeePerBlobGas"`
 	BlobHashes       []string `json:"blobVersionedHashes"`
-	Input            string  `json:"input"`
-	Nonce            string  `json:"nonce"`
-	TransactionIndex *string `json:"transactionIndex"`
-	Value            string  `json:"value"`
+	Input            string   `json:"input"`
+	Nonce            string   `json:"nonce"`
+	TransactionIndex *string  `json:"transactionIndex"`
+	Value            string   `json:"value"`
 }
 
 type rpcReceipt struct {

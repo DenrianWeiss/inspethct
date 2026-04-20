@@ -107,7 +107,6 @@ func (e *SimpleEngine) Run(cfg *ExecutionConfig) (*ExecutionResult, error) {
 	return res, err
 }
 
-
 func applyTopLevelCallValue(state EVMState, cfg *ExecutionConfig) (int, int, *ExecutionResult) {
 	if state == nil || cfg == nil || cfg.Value == nil || cfg.Value.Sign() == 0 {
 		return -1, -1, nil
