@@ -583,6 +583,7 @@ func (r *readOnlyState) TxContext() TxContext          { return r.inner.TxContex
 func (r *readOnlyState) ContractAddress() Address      { return r.inner.Contract().Address() }
 func (r *readOnlyState) ContractCaller() Address       { return r.inner.Contract().Caller() }
 func (r *readOnlyState) ContractCallValue() *big.Int   { return r.inner.Contract().CallValue() }
+func (r *readOnlyState) ContractCallInput() []byte     { return r.inner.Contract().CallInput() }
 func (r *readOnlyState) ContractCode() []byte          { return r.inner.Contract().Code() }
 func (r *readOnlyState) ContractCodeAddr() Address     { return r.inner.Contract().CodeAddr() }
 func (r *readOnlyState) Logs() []Log                   { return r.inner.Logs() }

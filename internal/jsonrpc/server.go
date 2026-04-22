@@ -62,6 +62,10 @@ type ReplaySession struct {
 	// that gdb.readMemory can serve random-access reads even when the inline
 	// pause payload was truncated for transport efficiency.
 	MemorySnapshot []byte `json:"-"`
+	// CallFrames mirrors the live CALL/DELEGATECALL/STATICCALL/CREATE stack
+	// from the root call (index 0) down to the currently executing frame.
+	// Maintained by the per-step debug hook by detecting CallDepth changes.
+	CallFrames []CallFrameInfo `json:"-"`
 }
 
 type request struct {

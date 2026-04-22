@@ -46,6 +46,15 @@ export interface LocalVariable {
   note?: string;
 }
 
+export interface CallFrameInfo {
+  depth: number;
+  contractAddress: string;
+  codeAddress: string;
+  callType?: string;
+  selector?: string;
+  inputSize: number;
+}
+
 export interface GdbSessionState {
   kind: "replay" | "call";
   id: string;
@@ -80,6 +89,7 @@ export interface GdbSessionState {
     callAccess?: unknown;
     storageAccess?: unknown;
     memoryAccess?: unknown;
+    callStack?: CallFrameInfo[];
   };
   call?: {
     from: string;

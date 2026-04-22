@@ -106,11 +106,22 @@ async function handleBreak(args: string[], runtime: InspethctRuntime): Promise<s
     case "func":
     case "function": {
       if (args.length < 2) {
-        return "usage: break func <signature>";
+        return "usage: break func <signature> [address]";
       }
-      const signature = args.slice(1).join(" ");
-      const id = `bp-fn-${signature}`;
-      await runtime.rawCall("gdb.setFunctionBreakpoint", [sessionId, { id, signature }]);
+      // Allow trailing 0x... address to scope the function BP to one contract.
+      let signature = args.slice(1).join(" ");
+      let address: string | undefined;
+      const tokens = signature.split(/\s+/);
+      if (tokens.length > 1 && /^0x[0-9a-fA-F]{40}$/.test(tokens[tokens.length - 1])) {
+        address = tokens[tokens.length - 1];
+        signature = tokens.slice(0, -1).join(" ");
+      }
+      const id = `bp-fn-${signature}${address ? `-${address}` : ""}`;
+      const body: Record<string, unknown> = { id, signature };
+      if (address) {
+        body.address = address;
+      }
+      await runtime.rawCall("gdb.setFunctionBreakpoint", [sessionId, body]);
       return `set ${id}`;
     }
     case "call": {
@@ -154,7 +165,7 @@ async function handleBreak(args: string[], runtime: InspethctRuntime): Promise<s
 
 async function handleInfo(args: string[], runtime: InspethctRuntime): Promise<string> {
   if (args.length === 0) {
-    return "usage: info <breakpoints|locals|stack|memory|storage|state>";
+    return "usage: info <breakpoints|locals|stack|frames|memory|storage|transient|state>";
   }
   const state = runtime.getState();
   const current = state?.current;
@@ -180,6 +191,17 @@ async function handleInfo(args: string[], runtime: InspethctRuntime): Promise<st
         return "stack empty";
       }
       return stack.map((value, index) => `  [${index}] ${value}`).join("\n");
+    }
+    case "frames":
+    case "calls":
+    case "callstack": {
+      const frames = current?.callStack ?? [];
+      if (frames.length === 0) {
+        return "no call stack info yet";
+      }
+      return frames
+        .map((f) => `  #${f.depth} [${f.callType ?? "?"}] ${f.codeAddress}${f.selector ? `  selector=${f.selector}` : ""}${f.inputSize ? `  input=${f.inputSize}B` : ""}`)
+        .join("\n");
     }
     case "memory": {
       const size = current?.memorySize ?? 0;
@@ -289,7 +311,7 @@ function helpText(topic?: string): string {
       "  b call <addr|signature>       set call breakpoint",
       "  b storage <addr> <slot> [acc] set storage breakpoint",
       "  b memory <off> <size> [acc]   set memory breakpoint",
-      "  info breakpoints|locals|stack|memory|storage|transient|state",
+      "  info breakpoints|locals|stack|frames|memory|storage|transient|state",
       "  print storage <name|slot>",
       "  print memory <off> <size>     hex dump (uses gdb.readMemory)",
       "  x <off> <size>                alias for print memory",

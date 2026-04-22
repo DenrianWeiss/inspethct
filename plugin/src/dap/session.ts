@@ -290,19 +290,45 @@ export class InspethctDebugSession extends LoggingDebugSession {
     const sourceName = current?.source?.sourceName;
     const localPath = this.runtime?.resolveLocalPath(sourceName);
 
+    const baseFrame: DebugProtocol.StackFrame = {
+      id: 1,
+      name: this.formatFrameName(current?.step?.op || "EVM", current?.callStack?.[current.callStack.length - 1]),
+      line: current?.source?.line || 1,
+      column: current?.source?.column || 1,
+      source: localPath ? new Source(sourceName || "contract", localPath) : undefined
+    };
+
+    const frames: DebugProtocol.StackFrame[] = [baseFrame];
+    const callStack = current?.callStack ?? [];
+    // Surface parent frames (older callers) below the current frame as
+    // synthetic entries so users can see who invoked the current contract.
+    // The active frame is already represented by `baseFrame` so we append
+    // depth-1 .. 0 in order from caller to root.
+    for (let i = callStack.length - 2; i >= 0; i--) {
+      const f = callStack[i];
+      frames.push({
+        id: 100 + f.depth,
+        name: this.formatFrameName(`depth ${f.depth}`, f),
+        line: 0,
+        column: 0,
+        presentationHint: "label"
+      });
+    }
+
     response.body = {
-      stackFrames: [
-        {
-          id: 1,
-          name: current?.step?.op || "EVM",
-          line: current?.source?.line || 1,
-          column: current?.source?.column || 1,
-          source: localPath ? new Source(sourceName || "contract", localPath) : undefined
-        }
-      ],
-      totalFrames: 1
+      stackFrames: frames,
+      totalFrames: frames.length
     };
     this.sendResponse(response);
+  }
+
+  private formatFrameName(prefix: string, frame?: import("./runtime").CallFrameInfo): string {
+    if (!frame) {
+      return prefix;
+    }
+    const tag = frame.callType ? `[${frame.callType}]` : "";
+    const sel = frame.selector ? ` ${frame.selector}` : "";
+    return `${prefix} ${tag} ${frame.codeAddress}${sel}`.trim();
   }
 
   protected scopesRequest(response: DebugProtocol.ScopesResponse, _args: DebugProtocol.ScopesArguments): void {

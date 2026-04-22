@@ -111,3 +111,30 @@ The composer supports tuple/array via JSON input.
 ## 6. Process Cleanup
 
 Only dbgserver processes started by extension are cleaned up on session end.
+
+## 7. Cross-contract Breakpoints & Call Stack
+
+Breakpoints fire inside any frame, including external CALLs, DELEGATECALLs, and CREATEs invoked by the entry transaction.
+
+- **Source breakpoints** continue to work as you set them in any open Solidity file. To scope a source breakpoint to one specific deployed address, the backend `gdb.setSourceBreakpoint` accepts an `address` field.
+- **Function breakpoints** (`break func <signature>` in the REPL) match the 4-byte selector at `PC=0` of every frame. Add an optional address to scope:
+
+  ```text
+  b func transfer(address,uint256)
+  b func transfer(address,uint256) 0xabcDEF...
+  ```
+
+- **Call stack inspection**:
+  - VS Code's Call Stack view shows the active EVM frame plus a label entry per parent frame: `[CALLTYPE] <codeAddress> <selector>`.
+  - REPL: `info frames` (aliases `calls`, `callstack`) prints each frame with depth, call type, code address, selector, and calldata size.
+
+To resolve sub-call sources, load each contract's source bundle via `gdb.loadSourceBundle` (the Sequence Builder and Solidity CodeLens flows already do this for known artifacts).
+
+## 8. Local variable decoding
+
+Locals reported by `info locals` carry a `confidence` tag:
+
+- `medium` — derived from solc `functionDebugData` (exact stack-slot counts, correct for via-IR and multi-slot ABI types).
+- `low` — derived from AST parameter/return counts only.
+
+Enable `functionDebugData` in your compiler config (see the plugin README) to upgrade decoding for your project.

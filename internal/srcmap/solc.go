@@ -32,9 +32,11 @@ type standardJSONEVM struct {
 }
 
 type standardJSONBytecode struct {
-	Object           string            `json:"object"`
-	SourceMap        string            `json:"sourceMap"`
-	GeneratedSources []generatedSource `json:"generatedSources"`
+	Object              string                                 `json:"object"`
+	SourceMap           string                                 `json:"sourceMap"`
+	GeneratedSources    []generatedSource                      `json:"generatedSources"`
+	FunctionDebugData   map[string]FunctionDebugInfo           `json:"functionDebugData"`
+	ImmutableReferences map[string][]ImmutableReferenceSegment `json:"immutableReferences"`
 }
 
 type generatedSource struct {
@@ -62,15 +64,19 @@ func BuildIndexFromStandardJSON(data []byte, cfg BuildConfig) (*Index, error) {
 	}
 
 	idx := &Index{
-		Build:              cfg,
-		Sources:            make(map[int]*SourceFile),
-		InstructionByPC:    make(map[uint64]*InstructionMapping),
-		NodesByID:          make(map[int]*ASTNode),
-		NodesBySourceID:    make(map[int][]*ASTNode),
-		GeneratedSourceIDs: make(map[int]struct{}),
-		PersistentLayout:   artifact.StorageLayout,
-		TransientLayout:    artifact.TransientStorageLayout,
-		ABI:                append([]ABIEntry(nil), artifact.ABI...),
+		Build:                cfg,
+		Sources:              make(map[int]*SourceFile),
+		InstructionByPC:      make(map[uint64]*InstructionMapping),
+		NodesByID:            make(map[int]*ASTNode),
+		NodesBySourceID:      make(map[int][]*ASTNode),
+		GeneratedSourceIDs:   make(map[int]struct{}),
+		PersistentLayout:     artifact.StorageLayout,
+		TransientLayout:      artifact.TransientStorageLayout,
+		ABI:                  append([]ABIEntry(nil), artifact.ABI...),
+		FunctionDebugData:    map[string]FunctionDebugInfo{},
+		FunctionDebugByID:    map[int]*FunctionDebugInfo{},
+		FunctionDebugByEntry: map[uint64]*FunctionDebugInfo{},
+		ImmutableReferences:  map[string][]ImmutableReferenceSegment{},
 	}
 
 	for name, src := range doc.Sources {
@@ -99,6 +105,25 @@ func BuildIndexFromStandardJSON(data []byte, cfg BuildConfig) (*Index, error) {
 	if cfg.Runtime {
 		selected = artifact.EVM.DeployedBytecode
 		selectedCode = idx.RuntimeBytecode
+	}
+
+	for name, info := range selected.FunctionDebugData {
+		entry := info
+		entry.Name = name
+		idx.FunctionDebugData[name] = entry
+	}
+	for name := range idx.FunctionDebugData {
+		entry := idx.FunctionDebugData[name]
+		ref := &entry
+		if entry.ID != 0 {
+			idx.FunctionDebugByID[entry.ID] = ref
+		}
+		if entry.HasEntryPoint {
+			idx.FunctionDebugByEntry[entry.EntryPoint] = ref
+		}
+	}
+	for key, segments := range selected.ImmutableReferences {
+		idx.ImmutableReferences[key] = append([]ImmutableReferenceSegment(nil), segments...)
 	}
 
 	instructions, err := ParseInstructionMappings(selectedCode, selected.SourceMap)

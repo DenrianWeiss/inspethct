@@ -43,6 +43,20 @@ type ReplayPause struct {
 	MemoryAccess      *MemoryAccess          `json:"memoryAccess,omitempty"`
 	Metadata          any                    `json:"metadata,omitempty"`
 	Step              forkengineTracePayload `json:"step"`
+	CallStack         []CallFrameInfo        `json:"callStack,omitempty"`
+}
+
+// CallFrameInfo describes one frame on the active call stack at the time of
+// a pause. Index 0 is the root transaction frame; the last element is the
+// currently executing frame. Selector is the first 4 bytes of the frame's
+// calldata (when at least 4 bytes are present).
+type CallFrameInfo struct {
+	Depth           int    `json:"depth"`
+	ContractAddress string `json:"contractAddress"`
+	CodeAddress     string `json:"codeAddress"`
+	CallType        string `json:"callType,omitempty"` // "root" | "call" | "delegatecall" | "staticcall" | "callcode" | "create"
+	Selector        string `json:"selector,omitempty"`
+	InputSize       int    `json:"inputSize"`
 }
 
 // MemoryRegionInfo describes a contiguous range of EVM memory with a
@@ -178,6 +192,7 @@ type sourceBreakpointRequest struct {
 type functionBreakpointRequest struct {
 	ID        string `json:"id"`
 	Signature string `json:"signature"`
+	Address   string `json:"address,omitempty"`
 }
 
 type callBreakpointRequest struct {
@@ -255,6 +270,7 @@ func (server *Server) replaySession(ctx context.Context, session *ReplaySession,
 	session.LastStep = -1
 	session.PendingPause = nil
 	session.Current = nil
+	session.CallFrames = session.CallFrames[:0]
 
 	debugHooks := engine.NewSimpleHookRegistry()
 	_ = debugHooks.Register(&debugStepHook{session: session, continueMode: continueMode})
@@ -340,6 +356,7 @@ func (hook *debugStepHook) Fire(ctx *engine.HookContext) (*engine.HookResult, er
 	hook.seen++
 	hook.session.LastStep = stepIndex
 	hook.applyMutations(ctx, stepIndex)
+	updateCallFrames(hook.session, ctx)
 	if stepIndex <= hook.session.Position {
 		return &engine.HookResult{Action: engine.ActionContinue}, nil
 	}
@@ -569,6 +586,9 @@ func capturePause(session *ReplaySession, ctx *engine.HookContext, stepIndex int
 	pause.MemoryRegions = describeMemoryRegions(ctx.State)
 	pause.FreeMemoryPointer = readFreeMemoryPointer(ctx.State)
 	pause.Stack = encodeStackSnapshot(ctx.State)
+	if len(session.CallFrames) > 0 {
+		pause.CallStack = append([]CallFrameInfo(nil), session.CallFrames...)
+	}
 	if bundle := bundleForCodeAddress(session, codeAddr); bundle != nil {
 		pause.Metadata = bundle.Metadata
 		if ctx.Opcode != nil {
@@ -606,6 +626,115 @@ func encodeStackSnapshot(state engine.ReadOnlyState) []string {
 		out[i] = encodeHash(engine.Hash(word))
 	}
 	return out
+}
+
+// updateCallFrames keeps session.CallFrames in sync with the live EVM call
+// stack. It is invoked from the per-step hook so it sees every depth change
+// (CALL/STATICCALL/DELEGATECALL/CALLCODE/CREATE/CREATE2 entry, and any
+// RETURN/REVERT/STOP/SELFDESTRUCT exit).
+func updateCallFrames(session *ReplaySession, ctx *engine.HookContext) {
+	if session == nil || ctx == nil || ctx.State == nil {
+		return
+	}
+	depth := ctx.State.CallDepth()
+	if len(session.CallFrames) == 0 {
+		// Seed the root frame the first time we see any instruction.
+		session.CallFrames = []CallFrameInfo{newFrame(ctx, 0, "root")}
+		// If the first observed depth > 0 (rare; mid-trace resume) backfill
+		// placeholders so indexing stays consistent.
+		for d := 1; d <= depth; d++ {
+			session.CallFrames = append(session.CallFrames, newFrame(ctx, d, "unknown"))
+		}
+		return
+	}
+	currentTop := len(session.CallFrames) - 1
+	if depth == currentTop {
+		// Same frame — just refresh the top in case calldata wasn't ready
+		// at entry (defensive; live calldata should be stable per frame).
+		session.CallFrames[currentTop] = mergeFrame(session.CallFrames[currentTop], ctx, depth)
+		return
+	}
+	if depth > currentTop {
+		// Pushed one or more frames. We only have one transition per step,
+		// so usually depth == currentTop+1.
+		for d := currentTop + 1; d <= depth; d++ {
+			callType := classifyCallType(ctx)
+			session.CallFrames = append(session.CallFrames, newFrame(ctx, d, callType))
+		}
+		return
+	}
+	// depth < currentTop: popped one or more frames.
+	if depth < 0 {
+		depth = 0
+	}
+	if depth+1 <= len(session.CallFrames) {
+		session.CallFrames = session.CallFrames[:depth+1]
+	}
+	session.CallFrames[depth] = mergeFrame(session.CallFrames[depth], ctx, depth)
+}
+
+func newFrame(ctx *engine.HookContext, depth int, callType string) CallFrameInfo {
+	frame := CallFrameInfo{Depth: depth, CallType: callType}
+	if ctx == nil || ctx.State == nil {
+		return frame
+	}
+	frame.ContractAddress = addressHex(ctx.State.ContractAddress())
+	frame.CodeAddress = addressHex(ctx.State.ContractCodeAddr())
+	if input := ctx.State.ContractCallInput(); len(input) > 0 {
+		frame.InputSize = len(input)
+		if len(input) >= 4 {
+			frame.Selector = "0x" + hex.EncodeToString(input[:4])
+		}
+	}
+	return frame
+}
+
+func mergeFrame(prev CallFrameInfo, ctx *engine.HookContext, depth int) CallFrameInfo {
+	next := newFrame(ctx, depth, prev.CallType)
+	if next.CallType == "" || next.CallType == "unknown" {
+		next.CallType = prev.CallType
+	}
+	if next.ContractAddress == "" || next.ContractAddress == "0x0000000000000000000000000000000000000000" {
+		next.ContractAddress = prev.ContractAddress
+	}
+	if next.CodeAddress == "" || next.CodeAddress == "0x0000000000000000000000000000000000000000" {
+		next.CodeAddress = prev.CodeAddress
+	}
+	if next.Selector == "" {
+		next.Selector = prev.Selector
+	}
+	if next.InputSize == 0 {
+		next.InputSize = prev.InputSize
+	}
+	return next
+}
+
+// classifyCallType inspects the immediately preceding opcode (still
+// accessible via ctx.Opcode if the hook fires before the new frame's first
+// instruction) to label the new frame's call type. We fall back to "call"
+// when the opcode is unrecognised or unavailable.
+func classifyCallType(ctx *engine.HookContext) string {
+	if ctx == nil || ctx.Opcode == nil {
+		return "call"
+	}
+	switch strings.ToUpper(engine.OpcodeName(ctx.Opcode.Op)) {
+	case "CALL":
+		return "call"
+	case "STATICCALL":
+		return "staticcall"
+	case "DELEGATECALL":
+		return "delegatecall"
+	case "CALLCODE":
+		return "callcode"
+	case "CREATE":
+		return "create"
+	case "CREATE2":
+		return "create2"
+	}
+	// Most likely the per-step hook fires AFTER the depth change, in which
+	// case ctx.Opcode is the first instruction of the new frame. Treat as
+	// generic call.
+	return "call"
 }
 
 func readFreeMemoryPointer(state engine.ReadOnlyState) uint64 {
@@ -767,20 +896,37 @@ func collectLocalsAtPC(index *srcmap.Index, ctx *engine.HookContext, pc uint64) 
 	returnDecls := paramListFrom(enclosing.Raw, "returnParameters")
 	paramCount := len(paramDecls)
 	returnCount := len(returnDecls)
+	confidence := "low"
 
-	locals := make([]LocalVariable, 0, paramCount+returnCount+4)
+	// Prefer solc's functionDebugData when available — it gives the exact
+	// stack-slot counts (which can differ from len(parameters[]) for
+	// reference types or via-IR codegen). Match by AST node id.
+	if dbg, ok := index.FunctionDebugByID[enclosing.ID]; ok && dbg != nil {
+		if dbg.ParameterSlots > 0 || dbg.ReturnSlots > 0 {
+			paramCount = dbg.ParameterSlots
+			returnCount = dbg.ReturnSlots
+			confidence = "medium"
+		}
+	}
+
+	locals := make([]LocalVariable, 0, len(paramDecls)+len(returnDecls)+4)
 
 	// Parameters: param at index i (declaration order) lives at depth
-	// (M + N - 1 - i) from the top of stack at function entry.
+	// (M + N - 1 - i) from the top of stack at function entry. When the
+	// per-decl slot count is greater than 1 (e.g. dynamic memory bytes
+	// passed as ABI head + tail), bail to "low" since the simple mapping
+	// breaks down.
 	for i, decl := range paramDecls {
 		depth := returnCount + (paramCount - 1 - i)
 		l := buildLocalDecl(decl, "parameter", file)
 		l = decodeIfStackResolvable(l, ctx.State, depth)
+		if l.Confidence == "low" || l.Confidence == "" {
+			l.Confidence = confidence
+		}
 		locals = append(locals, l)
 	}
 
 	// Named returns: return at index i lives at depth (M - 1 - i) from top.
-	// Anonymous returns are skipped (no name to display).
 	for i, decl := range returnDecls {
 		name, _ := decl["name"].(string)
 		if name == "" {
@@ -789,8 +935,9 @@ func collectLocalsAtPC(index *srcmap.Index, ctx *engine.HookContext, pc uint64) 
 		depth := returnCount - 1 - i
 		l := buildLocalDecl(decl, "return", file)
 		l = decodeIfStackResolvable(l, ctx.State, depth)
-		// Named returns are zero-initialized but stack mutations can still
-		// reorder them; mark "low" confidence like parameters.
+		if l.Confidence == "low" || l.Confidence == "" {
+			l.Confidence = confidence
+		}
 		locals = append(locals, l)
 	}
 
@@ -1361,6 +1508,9 @@ func (server *Server) setFunctionBreakpoint(params []json.RawMessage) (any, *res
 		id = fmt.Sprintf("bp-function-%s", canonical)
 	}
 	breakpoint := DebugBreakpoint{ID: id, Kind: "function", Display: fmt.Sprintf("function %s", canonical), Signature: canonical, selector: append([]byte(nil), method.ID...)}
+	if addr, ok := parseAddress(request.Address); ok {
+		breakpoint.CodeAddress = addressHex(addr)
+	}
 	upsertBreakpoint(session, breakpoint)
 	return server.describeSession(session), nil
 }
@@ -1894,15 +2044,31 @@ func (session *ReplaySession) matchRootFunctionBreakpoint(ctx *engine.HookContex
 	if ctx == nil || ctx.State == nil || ctx.Opcode == nil {
 		return nil
 	}
-	if ctx.State.CallDepth() != 0 || ctx.Opcode.PC != 0 {
+	if ctx.Opcode.PC != 0 {
 		return nil
+	}
+	depth := ctx.State.CallDepth()
+	codeAddr := addressHex(ctx.State.ContractCodeAddr())
+	// At depth 0 we match against the root's recorded input. At deeper
+	// frames we must use the live calldata (root input is for the outer
+	// transaction, not for the inner CALL/STATICCALL/DELEGATECALL).
+	var input []byte
+	if depth == 0 {
+		input = session.RootInput
+	} else {
+		input = ctx.State.ContractCallInput()
 	}
 	for index := range session.Breakpoints {
 		breakpoint := &session.Breakpoints[index]
 		if breakpoint.Kind != "function" {
 			continue
 		}
-		if selectorMatches(session.RootInput, breakpoint.selector) {
+		// Optional address filter — when set, only match when entering the
+		// specified contract.
+		if breakpoint.CodeAddress != "" && breakpoint.CodeAddress != codeAddr {
+			continue
+		}
+		if selectorMatches(input, breakpoint.selector) {
 			return breakpoint
 		}
 	}

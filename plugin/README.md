@@ -15,6 +15,40 @@ This extension provides interactive Solidity debugging through inspethctd dbgser
 - Source bundle selection prompt at session launch.
 - Native sequence session integration (`gdb.startSequenceSession` / `gdb.nextStepSession`) when backend supports it.
 - State patch integration (`gdb.exportStatePatch` / `gdb.importStatePatch`) via backend-native sequence carry.
+- Cross-contract debugging: source and function breakpoints fire inside CALL/STATICCALL/DELEGATECALL/CREATE targets, not just the entry transaction.
+- Live call stack: per-frame contract address, call type, and selector are surfaced in the VS Code Call Stack view (parent frames shown as label entries) and in the REPL via `info frames`.
+- Improved local variable decoding: when solc emits `functionDebugData`, parameter and named-return values are resolved using exact stack-slot counts and reported with `confidence=medium`.
+
+## Compiler configuration for richer locals
+
+To enable medium-confidence local decoding, ask the Solidity compiler to emit `functionDebugData`:
+
+- **Foundry** (`foundry.toml`):
+  ```toml
+  extra_output = [
+    "evm.bytecode.functionDebugData",
+    "evm.deployedBytecode.functionDebugData",
+    "evm.deployedBytecode.immutableReferences"
+  ]
+  ```
+- **Hardhat** (`hardhat.config.{js,ts}`):
+  ```js
+  solidity: {
+    settings: {
+      outputSelection: {
+        "*": {
+          "*": [
+            "evm.bytecode.functionDebugData",
+            "evm.deployedBytecode.functionDebugData",
+            "evm.deployedBytecode.immutableReferences"
+          ]
+        }
+      }
+    }
+  }
+  ```
+
+Without these the plugin falls back to AST-derived counts (`confidence=low`) — debugging still works, just less precise for via-IR / multi-slot ABI types.
 
 ## Compatibility
 

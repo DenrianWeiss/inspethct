@@ -282,6 +282,8 @@ type ReadOnlyState interface {
 	ContractCaller() Address
 	// ContractCallValue returns the value sent in the current call.
 	ContractCallValue() *big.Int
+	// ContractCallInput returns the input data of the current call frame.
+	ContractCallInput() []byte
 	// ContractCode returns the code currently being executed.
 	ContractCode() []byte
 	// ContractCodeAddr returns the address whose code is currently executing.

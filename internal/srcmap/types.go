@@ -257,6 +257,64 @@ type Index struct {
 	CreationBytecode   []byte
 	RuntimeBytecode    []byte
 	GeneratedSourceIDs map[int]struct{}
+	// FunctionDebugData maps the solc-mangled function name (e.g.
+	// "@_constructor_5", "fun_transfer_42") to its entry PC, AST id and
+	// stack-slot counts for parameters and return variables. Populated from
+	// evm.deployedBytecode.functionDebugData when Build.Runtime is true,
+	// otherwise from evm.bytecode.functionDebugData.
+	FunctionDebugData map[string]FunctionDebugInfo
+	// FunctionDebugByID indexes FunctionDebugData by AST node id for O(1)
+	// lookup from the AST walker.
+	FunctionDebugByID map[int]*FunctionDebugInfo
+	// FunctionDebugByEntry indexes FunctionDebugData by entry PC.
+	FunctionDebugByEntry map[uint64]*FunctionDebugInfo
+	// ImmutableReferences lists the runtime-bytecode byte ranges occupied by
+	// each immutable variable (keyed by AST node id as decimal string).
+	ImmutableReferences map[string][]ImmutableReferenceSegment
+}
+
+// FunctionDebugInfo mirrors a single entry from solc's
+// `functionDebugData` map. EntryPoint is the bytecode PC where the
+// internal function begins; ID matches the FunctionDefinition AST node id;
+// ParameterSlots and ReturnSlots are stack-slot counts (each slot = 32
+// bytes / 1 stack word). Solc may omit EntryPoint for inlined functions.
+type FunctionDebugInfo struct {
+	Name           string `json:"-"`
+	EntryPoint     uint64 `json:"entryPoint"`
+	HasEntryPoint  bool   `json:"-"`
+	ID             int    `json:"id"`
+	ParameterSlots int    `json:"parameterSlots"`
+	ReturnSlots    int    `json:"returnSlots"`
+}
+
+// UnmarshalJSON tolerates the optional/null entryPoint field that solc
+// emits for inlined / removed functions.
+func (f *FunctionDebugInfo) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		EntryPoint     *uint64 `json:"entryPoint"`
+		ID             int     `json:"id"`
+		ParameterSlots int     `json:"parameterSlots"`
+		ReturnSlots    int     `json:"returnSlots"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	f.ID = raw.ID
+	f.ParameterSlots = raw.ParameterSlots
+	f.ReturnSlots = raw.ReturnSlots
+	if raw.EntryPoint != nil {
+		f.EntryPoint = *raw.EntryPoint
+		f.HasEntryPoint = true
+	}
+	return nil
+}
+
+// ImmutableReferenceSegment is a (start, length) byte range in the runtime
+// bytecode that holds an immutable variable's value (zero-padded at compile
+// time, written by the constructor).
+type ImmutableReferenceSegment struct {
+	Start  uint64 `json:"start"`
+	Length uint64 `json:"length"`
 }
 
 // ABIJSON returns the canonical ABI JSON for the indexed contract.
