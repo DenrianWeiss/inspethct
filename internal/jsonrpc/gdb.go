@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,9 +57,9 @@ type MemoryRegionInfo struct {
 
 // LocalVariable describes a local declared in scope at the current PC. The
 // Value field is best-effort: it is populated only when the variable can be
-// matched to a stack slot with high confidence (e.g. value-type parameter
-// without intervening branches). Otherwise Value is empty and Confidence is
-// "unavailable".
+// matched to a stack slot with reasonable confidence (e.g. a value-type
+// parameter or named return early in the function body). Otherwise Value is
+// empty and Confidence is "unavailable".
 type LocalVariable struct {
 	Name            string `json:"name"`
 	Type            string `json:"type"`
@@ -66,8 +67,10 @@ type LocalVariable struct {
 	Kind            string `json:"kind"` // parameter | return | local
 	DeclaredAtLine  int    `json:"declaredAtLine,omitempty"`
 	Value           string `json:"value,omitempty"`
-	Confidence      string `json:"confidence,omitempty"` // resolved | unavailable
-	StackDepth      int    `json:"stackDepth,omitempty"`
+	Confidence      string `json:"confidence,omitempty"` // resolved | low | unavailable
+	StackIndex      int    `json:"stackIndex,omitempty"` // 1-based offset from top of stack; 0 = unknown
+	MemoryPointer   uint64 `json:"memoryPointer,omitempty"`
+	Note            string `json:"note,omitempty"`
 }
 
 // pauseInlineMemoryCap caps the memory blob that ships in pause payloads. The
@@ -722,11 +725,26 @@ func sourceForPC(index *srcmap.Index, pc uint64) map[string]any {
 }
 
 // collectLocalsAtPC walks the AST upward from the deepest node covering the
-// current PC, locating the enclosing FunctionDefinition / ModifierDefinition,
+// current PC, locates the enclosing FunctionDefinition / ModifierDefinition,
 // and returns parameters, return parameters, and locally declared variables
-// that source-textually precede the current execution point. Values are
-// best-effort and currently always reported as unavailable until per-step
-// stack-slot tracking is implemented.
+// that source-textually precede the current execution point.
+//
+// Stack layout assumed (Solidity legacy calling convention):
+//
+//	bottom -> [returnPC, param1..paramN, return1..returnM, body locals...] <- top
+//
+// So from the top of stack:
+//
+//	StackPeekN(0)              = last body local pushed (or last return slot)
+//	StackPeekN(M-1)            = first named return
+//	StackPeekN(M)              = paramN
+//	StackPeekN(M+N-1)          = param1
+//	StackPeekN(M+N)            = returnPC
+//
+// Values for parameters and named returns are decoded from these slots and
+// labeled with Confidence "low" because the assumption breaks down once the
+// body has executed enough operations to reorder the stack. Body-declared
+// locals are reported as declarations only.
 func collectLocalsAtPC(index *srcmap.Index, ctx *engine.HookContext, pc uint64) []LocalVariable {
 	if index == nil || ctx == nil {
 		return nil
@@ -737,8 +755,6 @@ func collectLocalsAtPC(index *srcmap.Index, ctx *engine.HookContext, pc uint64) 
 	}
 	enclosing := findEnclosingFunctionLikeNode(index, mapping.AST)
 	if enclosing == nil {
-		// Fall back to scanning by source range when the instruction's AST
-		// pointer lies outside the indexed nodes (e.g. compiler-generated).
 		enclosing = findEnclosingFunctionLikeBySource(index, mapping.Source)
 	}
 	if enclosing == nil {
@@ -746,42 +762,252 @@ func collectLocalsAtPC(index *srcmap.Index, ctx *engine.HookContext, pc uint64) 
 	}
 	currentStart := mapping.Source.Start
 	file := index.Sources[mapping.Source.SourceID]
-	locals := make([]LocalVariable, 0)
 
-	// Parameters and return parameters.
-	for _, group := range []struct {
-		key  string
-		kind string
-	}{{"parameters", "parameter"}, {"returnParameters", "return"}} {
-		params := paramListFrom(enclosing.Raw, group.key)
-		for _, decl := range params {
-			locals = appendLocal(locals, decl, group.kind, currentStart, file, false)
-		}
+	paramDecls := paramListFrom(enclosing.Raw, "parameters")
+	returnDecls := paramListFrom(enclosing.Raw, "returnParameters")
+	paramCount := len(paramDecls)
+	returnCount := len(returnDecls)
+
+	locals := make([]LocalVariable, 0, paramCount+returnCount+4)
+
+	// Parameters: param at index i (declaration order) lives at depth
+	// (M + N - 1 - i) from the top of stack at function entry.
+	for i, decl := range paramDecls {
+		depth := returnCount + (paramCount - 1 - i)
+		l := buildLocalDecl(decl, "parameter", file)
+		l = decodeIfStackResolvable(l, ctx.State, depth)
+		locals = append(locals, l)
 	}
 
-	// Variables declared in the body that source-textually precede the PC.
+	// Named returns: return at index i lives at depth (M - 1 - i) from top.
+	// Anonymous returns are skipped (no name to display).
+	for i, decl := range returnDecls {
+		name, _ := decl["name"].(string)
+		if name == "" {
+			continue
+		}
+		depth := returnCount - 1 - i
+		l := buildLocalDecl(decl, "return", file)
+		l = decodeIfStackResolvable(l, ctx.State, depth)
+		// Named returns are zero-initialized but stack mutations can still
+		// reorder them; mark "low" confidence like parameters.
+		locals = append(locals, l)
+	}
+
+	// Body-declared variables that source-textually precede the PC. Stack
+	// values are not resolved for these (declaration order vs. stack slot
+	// is not stable enough to guess without per-step tracking).
 	walkASTRaw(enclosing.Raw, func(node map[string]any) bool {
 		nodeType, _ := node["nodeType"].(string)
 		if nodeType != "VariableDeclaration" {
 			return true
 		}
-		// Skip the parameter / return declarations already handled above.
 		src, ok := parseSrcAttr(node["src"])
 		if !ok {
 			return true
 		}
 		if src.Start >= currentStart {
-			return false // declared after current PC; ignore (and stop nested walk)
+			return false
 		}
-		// Skip declarations that belong to a parameter list of a nested
-		// function or event (we only want this function's body locals).
 		if isInsideParameterList(enclosing.Raw, node) {
 			return true
 		}
-		locals = appendLocal(locals, node, "local", currentStart, file, true)
+		l := buildLocalDecl(node, "local", file)
+		if l.Name == "" {
+			return true
+		}
+		locals = append(locals, l)
 		return true
 	})
 	return locals
+}
+
+func buildLocalDecl(decl map[string]any, kind string, file *srcmap.SourceFile) LocalVariable {
+	name, _ := decl["name"].(string)
+	typeStr := ""
+	if td, ok := decl["typeDescriptions"].(map[string]any); ok {
+		typeStr, _ = td["typeString"].(string)
+	}
+	if typeStr == "" {
+		if tn, ok := decl["typeName"].(map[string]any); ok {
+			if td, ok := tn["typeDescriptions"].(map[string]any); ok {
+				typeStr, _ = td["typeString"].(string)
+			}
+		}
+	}
+	storageLoc, _ := decl["storageLocation"].(string)
+	if storageLoc == "" || storageLoc == "default" {
+		storageLoc = "stack"
+	}
+	line := 0
+	if file != nil {
+		if src, ok := parseSrcAttr(decl["src"]); ok {
+			l, _ := file.LineColumnForOffset(src.Start)
+			line = l
+		}
+	}
+	return LocalVariable{
+		Name:            name,
+		Type:            typeStr,
+		StorageLocation: storageLoc,
+		Kind:            kind,
+		DeclaredAtLine:  line,
+		Confidence:      "unavailable",
+	}
+}
+
+// decodeIfStackResolvable peeks the stack at the given depth (from top) and
+// fills in Value/Confidence/StackIndex/MemoryPointer when the type is
+// recognised. The caller must have already populated the structural fields.
+func decodeIfStackResolvable(l LocalVariable, state engine.ReadOnlyState, depth int) LocalVariable {
+	if state == nil || depth < 0 || depth >= state.StackLen() {
+		return l
+	}
+	l.StackIndex = depth + 1 // 1-based
+	word := state.StackPeekN(depth)
+	value, ptr, note := decodeValueByType(word, l.Type, l.StorageLocation, state)
+	if value != "" {
+		l.Value = value
+		l.Confidence = "low"
+	}
+	if ptr != 0 {
+		l.MemoryPointer = ptr
+	}
+	if note != "" {
+		l.Note = note
+	}
+	return l
+}
+
+// decodeValueByType maps a 32-byte stack word to a human-readable value based
+// on the Solidity typeString. For reference types stored in memory the word is
+// a memory offset; we follow it (length + data) for bytes/string. For storage
+// reference types the word is a slot number; the value is reported as the slot
+// hex with a note. The returned ptr is the memory offset when meaningful.
+func decodeValueByType(word engine.Word, typeStr, storageLoc string, state engine.ReadOnlyState) (value string, ptr uint64, note string) {
+	t := strings.TrimSpace(typeStr)
+	lower := strings.ToLower(t)
+	wordHex := "0x" + hex.EncodeToString(word[:])
+
+	switch storageLoc {
+	case "memory":
+		offset := word.ToBig().Uint64()
+		switch {
+		case strings.HasPrefix(lower, "string") || strings.HasPrefix(lower, "bytes ") || lower == "bytes":
+			return decodeMemoryBytes(state, offset, strings.HasPrefix(lower, "string"))
+		}
+		return wordHex, offset, "memory pointer"
+	case "storage", "storage pointer", "storage ref":
+		return wordHex, 0, "storage slot"
+	case "calldata":
+		return wordHex, 0, "calldata offset"
+	}
+
+	// Stack-located value types.
+	switch {
+	case strings.HasPrefix(lower, "address"):
+		return "0x" + hex.EncodeToString(word[12:]), 0, ""
+	case lower == "bool":
+		nonzero := false
+		for _, b := range word {
+			if b != 0 {
+				nonzero = true
+				break
+			}
+		}
+		if nonzero {
+			return "true", 0, ""
+		}
+		return "false", 0, ""
+	case strings.HasPrefix(lower, "uint"):
+		return word.ToBig().String() + " (" + wordHex + ")", 0, ""
+	case strings.HasPrefix(lower, "int"):
+		bits := parseIntBits(lower) // 256 if unspecified
+		signed := signedFromWord(word, bits)
+		return signed.String() + " (" + wordHex + ")", 0, ""
+	case strings.HasPrefix(lower, "bytes") && len(lower) > len("bytes"):
+		// bytesN
+		n := parseBytesN(lower)
+		if n > 0 && n <= 32 {
+			return "0x" + hex.EncodeToString(word[:n]), 0, ""
+		}
+	case strings.HasPrefix(lower, "contract ") || strings.HasPrefix(lower, "contract"):
+		return "0x" + hex.EncodeToString(word[12:]), 0, "contract reference"
+	case strings.HasPrefix(lower, "function"):
+		return wordHex, 0, "function pointer"
+	case strings.HasPrefix(lower, "enum"):
+		return word.ToBig().String(), 0, ""
+	}
+	return wordHex, 0, "raw stack word"
+}
+
+// decodeMemoryBytes reads [length:32][data:length] starting at offset and
+// returns either a quoted utf-8 string (when isString) or a hex blob.
+func decodeMemoryBytes(state engine.ReadOnlyState, offset uint64, isString bool) (string, uint64, string) {
+	if state == nil {
+		return "", offset, ""
+	}
+	memLen := uint64(state.MemoryLen())
+	if offset+32 > memLen {
+		return "", offset, "pointer beyond memory"
+	}
+	header := state.MemoryGet(offset, 32)
+	length := new(big.Int).SetBytes(header).Uint64()
+	const maxRead uint64 = 4096
+	read := length
+	if read > maxRead {
+		read = maxRead
+	}
+	if offset+32+read > memLen {
+		if memLen > offset+32 {
+			read = memLen - (offset + 32)
+		} else {
+			read = 0
+		}
+	}
+	data := state.MemoryGet(offset+32, read)
+	if isString {
+		s := string(data)
+		if length > read {
+			s += fmt.Sprintf("…(+%d bytes)", length-read)
+		}
+		return strconv.Quote(s) + fmt.Sprintf(" (len=%d)", length), offset, "memory string"
+	}
+	return "0x" + hex.EncodeToString(data) + fmt.Sprintf(" (len=%d)", length), offset, "memory bytes"
+}
+
+func parseIntBits(t string) int {
+	rest := strings.TrimPrefix(t, "int")
+	if rest == "" {
+		return 256
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil || n <= 0 || n > 256 {
+		return 256
+	}
+	return n
+}
+
+func parseBytesN(t string) int {
+	rest := strings.TrimPrefix(t, "bytes")
+	n, err := strconv.Atoi(rest)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func signedFromWord(word engine.Word, bits int) *big.Int {
+	v := new(big.Int).SetBytes(word[:])
+	if bits <= 0 || bits > 256 {
+		bits = 256
+	}
+	signBit := new(big.Int).Lsh(big.NewInt(1), uint(bits-1))
+	if v.Cmp(signBit) >= 0 {
+		mod := new(big.Int).Lsh(big.NewInt(1), uint(bits))
+		v.Sub(v, mod)
+	}
+	return v
 }
 
 func findEnclosingFunctionLikeNode(index *srcmap.Index, node *srcmap.ASTNode) *srcmap.ASTNode {
@@ -842,45 +1068,13 @@ func paramListFrom(raw map[string]any, key string) []map[string]any {
 }
 
 func appendLocal(locals []LocalVariable, decl map[string]any, kind string, currentStart int, file *srcmap.SourceFile, requireBeforePC bool) []LocalVariable {
-	name, _ := decl["name"].(string)
-	if name == "" {
+	_ = currentStart
+	_ = requireBeforePC
+	l := buildLocalDecl(decl, kind, file)
+	if l.Name == "" {
 		return locals
 	}
-	src, ok := parseSrcAttr(decl["src"])
-	if !ok {
-		return locals
-	}
-	if requireBeforePC && src.Start >= currentStart {
-		return locals
-	}
-	typeStr := ""
-	if td, ok := decl["typeDescriptions"].(map[string]any); ok {
-		typeStr, _ = td["typeString"].(string)
-	}
-	if typeStr == "" {
-		if tn, ok := decl["typeName"].(map[string]any); ok {
-			if td, ok := tn["typeDescriptions"].(map[string]any); ok {
-				typeStr, _ = td["typeString"].(string)
-			}
-		}
-	}
-	storageLoc, _ := decl["storageLocation"].(string)
-	if storageLoc == "" || storageLoc == "default" {
-		storageLoc = "stack"
-	}
-	line := 0
-	if file != nil {
-		l, _ := file.LineColumnForOffset(src.Start)
-		line = l
-	}
-	return append(locals, LocalVariable{
-		Name:            name,
-		Type:            typeStr,
-		StorageLocation: storageLoc,
-		Kind:            kind,
-		DeclaredAtLine:  line,
-		Confidence:      "unavailable",
-	})
+	return append(locals, l)
 }
 
 func parseSrcAttr(value any) (srcmap.SourceRange, bool) {

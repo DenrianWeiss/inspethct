@@ -41,7 +41,9 @@ export interface LocalVariable {
   declaredAtLine?: number;
   value?: string;
   confidence?: string;
-  stackDepth?: number;
+  stackIndex?: number;
+  memoryPointer?: number;
+  note?: string;
 }
 
 export interface GdbSessionState {

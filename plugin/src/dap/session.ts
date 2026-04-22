@@ -16,6 +16,7 @@ import { InspethctLaunchConfig } from "../types";
 import { InspethctRuntime } from "./runtime";
 import { DbgserverProcessManager } from "../services/processManager";
 import { runRepl } from "./repl";
+import { getAddress, toUtf8String } from "ethers";
 
 const THREAD_ID = 1;
 
@@ -474,13 +475,27 @@ export class InspethctDebugSession extends LoggingDebugSession {
       return [{ name: "<no locals>", value: "AST scope unavailable at current PC", variablesReference: 0 }];
     }
     return bag.locals.map((local) => {
-      const value = local.value && local.value.length > 0
-        ? local.value
-        : `<${local.confidence || "unavailable"}>`;
-      const display = `${local.kind} ${local.type}${local.storageLocation && local.storageLocation !== "stack" ? ` (${local.storageLocation})` : ""}`;
+      const hasValue = !!local.value && local.value.length > 0;
+      const value = hasValue ? local.value! : `<${local.confidence || "unavailable"}>`;
+      const tags: string[] = [local.kind];
+      if (local.storageLocation && local.storageLocation !== "stack") {
+        tags.push(local.storageLocation);
+      }
+      if (local.confidence && local.confidence !== "unavailable") {
+        tags.push(`conf=${local.confidence}`);
+      }
+      if (local.stackIndex && local.stackIndex > 0) {
+        tags.push(`stack[${local.stackIndex - 1}]`);
+      }
+      if (local.memoryPointer && local.memoryPointer > 0) {
+        tags.push(`mem@0x${local.memoryPointer.toString(16)}`);
+      }
+      const note = local.note ? `  // ${local.note}` : "";
+      const line = local.declaredAtLine ? `  L${local.declaredAtLine}` : "";
       return {
         name: local.name,
-        value: `${display} = ${value}${local.declaredAtLine ? `  // L${local.declaredAtLine}` : ""}`,
+        type: local.type,
+        value: `${value}  [${tags.join(", ")}]${line}${note}`,
         variablesReference: 0
       };
     });
@@ -708,26 +723,74 @@ function parseMemoryReference(ref: string | undefined): { offset: number; length
 
 function decodeStorageValue(entry: import("./runtime").StorageVariable): string {
   const raw = entry.value || "0x";
-  const type = (entry.type || "").toLowerCase();
+  const type = (entry.type || "").toLowerCase().replace(/^t_/, "");
   const bytes = hexToBytes(raw);
   if (bytes.length === 0) {
     return raw;
   }
-  if (type.startsWith("address")) {
-    if (bytes.length >= 20) {
-      const slice = bytes.subarray(bytes.length - 20);
-      return `0x${bufferToHex(slice)}`;
+  // address / contract / address payable
+  if (type.startsWith("address") || type.startsWith("contract")) {
+    try {
+      const slice = bytes.length >= 20 ? bytes.subarray(bytes.length - 20) : bytes;
+      return getAddress(`0x${bufferToHex(slice)}`);
+    } catch {
+      // fall through
     }
   }
-  if (type === "bool" || type === "t_bool") {
+  if (type === "bool") {
     return bytes[bytes.length - 1] === 0 ? "false" : "true";
   }
-  if (type.startsWith("uint") || type.startsWith("int") || type.startsWith("t_uint") || type.startsWith("t_int")) {
+  // bytesN (fixed) — e.g. bytes32, bytes4
+  const fixedBytes = type.match(/^bytes(\d+)$/);
+  if (fixedBytes) {
+    const n = Math.min(32, parseInt(fixedBytes[1], 10));
+    return `0x${bufferToHex(bytes.subarray(0, n))}`;
+  }
+  // intN (signed)
+  const intMatch = type.match(/^int(\d*)$/);
+  if (intMatch) {
+    const bits = intMatch[1] ? parseInt(intMatch[1], 10) : 256;
     try {
-      const big = BigInt(raw);
-      return type.startsWith("int")
-        ? big.toString()
-        : `${big.toString()} (0x${big.toString(16)})`;
+      const u = BigInt(raw);
+      const signBit = 1n << BigInt(bits - 1);
+      const signed = u >= signBit ? u - (1n << BigInt(bits)) : u;
+      return `${signed.toString()} (${raw})`;
+    } catch {
+      return raw;
+    }
+  }
+  // uintN (unsigned)
+  if (/^uint(\d*)$/.test(type)) {
+    try {
+      const u = BigInt(raw);
+      return `${u.toString()} (${raw})`;
+    } catch {
+      return raw;
+    }
+  }
+  // string/bytes (storage short form: low byte = 2*len for short ≤31 bytes;
+  // long form: low byte = 2*len+1, data lives at keccak(slot)). We can only
+  // decode the short form from a single slot.
+  if (type === "string" || type === "bytes") {
+    const lowByte = bytes[bytes.length - 1] ?? 0;
+    if ((lowByte & 1) === 0) {
+      const len = lowByte / 2;
+      const data = bytes.subarray(0, len);
+      if (type === "string") {
+        try {
+          return `${JSON.stringify(toUtf8String(data))} (len=${len})`;
+        } catch {
+          return `0x${bufferToHex(data)} (len=${len})`;
+        }
+      }
+      return `0x${bufferToHex(data)} (len=${len})`;
+    }
+    return `${raw} (long; data at keccak(slot))`;
+  }
+  // enum: numeric
+  if (type.startsWith("enum")) {
+    try {
+      return BigInt(raw).toString();
     } catch {
       return raw;
     }

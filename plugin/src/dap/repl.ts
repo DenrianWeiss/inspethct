@@ -319,7 +319,18 @@ function formatStateLine(state: GdbSessionState | undefined): string {
 
 function formatLocal(local: LocalVariable): string {
   const value = local.value && local.value.length > 0 ? local.value : `<${local.confidence ?? "unavailable"}>`;
-  return `  ${local.kind.padEnd(9)} ${local.name.padEnd(24)} ${(local.type || "").padEnd(20)} ${value}${local.declaredAtLine ? `  // L${local.declaredAtLine}` : ""}`;
+  const tags: string[] = [];
+  if (local.confidence && local.confidence !== "unavailable") {
+    tags.push(local.confidence);
+  }
+  if (local.stackIndex && local.stackIndex > 0) {
+    tags.push(`stack[${local.stackIndex - 1}]`);
+  }
+  if (local.memoryPointer && local.memoryPointer > 0) {
+    tags.push(`mem@0x${local.memoryPointer.toString(16)}`);
+  }
+  const tagStr = tags.length > 0 ? ` (${tags.join(",")})` : "";
+  return `  ${local.kind.padEnd(9)} ${local.name.padEnd(24)} ${(local.type || "").padEnd(20)} ${value}${tagStr}${local.declaredAtLine ? `  // L${local.declaredAtLine}` : ""}`;
 }
 
 function formatStorage(entry: StorageVariable): string {
