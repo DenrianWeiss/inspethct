@@ -1,0 +1,29 @@
+{
+  "name": "Inspethct sequence example",
+  "upstream": "http://127.0.0.1:8545",
+  "block": "latest",
+  "fork": "cancun",
+  "forkMode": "diff",
+  "carryUserMutations": true,
+  "promptSourceBundle": false,
+  "sequence": [
+    {
+      "label": "step-1",
+      "from": "0x0000000000000000000000000000000000000001",
+      "to": "0x0000000000000000000000000000000000000010",
+      "input": "0x",
+      "value": "0x0",
+      "gas": "0x0",
+      "block": "latest"
+    },
+    {
+      "label": "step-2",
+      "from": "0x0000000000000000000000000000000000000001",
+      "to": "0x0000000000000000000000000000000000000010",
+      "input": "0x",
+      "value": "0x0",
+      "gas": "0x0",
+      "block": "latest"
+    }
+  ]
+}

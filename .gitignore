@@ -19,5 +19,10 @@
 
 # !Makefile
 
+# Allow plugin folder and all files under it
+!plugin/
+!plugin/**
+
 # ...even if they are in subdirectories
 !*/
+!docs/*.md

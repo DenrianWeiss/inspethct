@@ -1,0 +1,226 @@
+{
+  "name": "inspethct-vscode",
+  "displayName": "Inspethct Debugger",
+  "description": "VS Code debugger for Inspethct dbgserver",
+  "version": "0.0.1",
+  "publisher": "inspethct",
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onDebug",
+    "onDebugResolve:inspethct",
+    "onLanguage:solidity",
+    "onCommand:inspethct.debugFunction",
+    "onCommand:inspethct.importReplayFromChain",
+    "onCommand:inspethct.runSequenceScript",
+    "onCommand:inspethct.openSequenceBuilder"
+  ],
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "solidity"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "inspethct",
+        "label": "Inspethct",
+        "languages": [
+          "solidity"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "request",
+              "type",
+              "name",
+              "upstream"
+            ],
+            "properties": {
+              "upstream": {
+                "type": "string",
+                "description": "Upstream RPC URL",
+                "default": "http://127.0.0.1:8545"
+              },
+              "dbgserverUrl": {
+                "type": "string",
+                "description": "Use existing dbgserver endpoint in attach mode"
+              },
+              "listenHost": {
+                "type": "string",
+                "default": "127.0.0.1"
+              },
+              "listenPort": {
+                "type": "number",
+                "default": 18548
+              },
+              "block": {
+                "type": "string",
+                "default": "latest"
+              },
+              "fork": {
+                "type": "string",
+                "default": "cancun"
+              },
+              "forkMode": {
+                "type": "string",
+                "default": "diff"
+              },
+              "autoStartDbgserver": {
+                "type": "boolean",
+                "default": true
+              },
+              "dbgserverBinaryPath": {
+                "type": "string",
+                "description": "Path to inspethctd binary"
+              },
+              "sessionType": {
+                "type": "string",
+                "enum": [
+                  "replay",
+                  "call",
+                  "sequence"
+                ],
+                "default": "replay"
+              },
+              "txHash": {
+                "type": "string"
+              },
+              "call": {
+                "type": "object",
+                "properties": {
+                  "from": { "type": "string" },
+                  "to": { "type": "string" },
+                  "input": { "type": "string" },
+                  "value": { "type": "string" },
+                  "gas": { "type": "string" },
+                  "block": { "type": "string" }
+                }
+              },
+              "sequence": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                },
+                "description": "Array of call steps for sequence mode"
+              },
+              "sourceBundle": {
+                "type": "object",
+                "description": "Optional source bundle config"
+              },
+              "promptSourceBundle": {
+                "type": "boolean",
+                "default": true
+              },
+              "carryUserMutations": {
+                "type": "boolean",
+                "default": true
+              }
+            }
+          }
+        },
+        "configurationSnippets": [
+          {
+            "label": "Inspethct: Replay Transaction",
+            "description": "Debug a chain transaction replay via dbgserver",
+            "body": {
+              "type": "inspethct",
+              "request": "launch",
+              "name": "Inspethct Replay",
+              "sessionType": "replay",
+              "upstream": "http://127.0.0.1:8545",
+              "txHash": "0x",
+              "autoStartDbgserver": true,
+              "promptSourceBundle": true
+            }
+          },
+          {
+            "label": "Inspethct: Call Debug",
+            "description": "Debug one synthetic call with custom sender",
+            "body": {
+              "type": "inspethct",
+              "request": "launch",
+              "name": "Inspethct Call",
+              "sessionType": "call",
+              "upstream": "http://127.0.0.1:8545",
+              "call": {
+                "from": "0x0000000000000000000000000000000000000001",
+                "to": "0x",
+                "input": "0x",
+                "value": "0x0",
+                "gas": "0x0",
+                "block": "latest"
+              },
+              "autoStartDbgserver": true,
+              "promptSourceBundle": true
+            }
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "inspethct.debugFunction",
+        "title": "Inspethct: Debug Function"
+      },
+      {
+        "command": "inspethct.importReplayFromChain",
+        "title": "Inspethct: Import Replay from Chain"
+      },
+      {
+        "command": "inspethct.runSequenceScript",
+        "title": "Inspethct: Run Sequence Script"
+      },
+      {
+        "command": "inspethct.openSequenceBuilder",
+        "title": "Inspethct: Open Sequence Builder"
+      }
+    ],
+    "configuration": {
+      "title": "Inspethct",
+      "properties": {
+        "inspethct.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to inspethctd. If empty, extension searches PATH."
+        },
+        "inspethct.defaultUpstream": {
+          "type": "string",
+          "default": "http://127.0.0.1:8545"
+        },
+        "inspethct.defaultFork": {
+          "type": "string",
+          "default": "cancun"
+        },
+        "inspethct.defaultBlock": {
+          "type": "string",
+          "default": "latest"
+        },
+        "inspethct.defaultForkMode": {
+          "type": "string",
+          "default": "diff"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "@vscode/debugadapter": "^1.67.0",
+    "@vscode/debugprotocol": "^1.67.0",
+    "ethers": "^6.15.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "@types/vscode": "^1.91.0",
+    "typescript": "^5.8.3"
+  }
+}

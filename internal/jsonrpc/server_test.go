@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"inspethct/internal/engine"
@@ -214,12 +216,222 @@ func TestDBGServerRestrictsNonGDBMethods(t *testing.T) {
 	if capabilities["mode"] != string(serverModeGDBOnly) {
 		t.Fatalf("mode = %v, want %q", capabilities["mode"], serverModeGDBOnly)
 	}
+	features, ok := capabilities["features"].(map[string]any)
+	if !ok {
+		t.Fatalf("features missing from capabilities: %#v", capabilities)
+	}
+	if enabled, ok := features["statePatch"].(bool); !ok || !enabled {
+		t.Fatalf("features.statePatch = %#v, want true", features["statePatch"])
+	}
+	methods, ok := capabilities["methods"].([]any)
+	if !ok {
+		t.Fatalf("methods missing from capabilities: %#v", capabilities)
+	}
+	if !containsAnyString(methods, "gdb.exportStatePatch") || !containsAnyString(methods, "gdb.importStatePatch") {
+		t.Fatalf("capabilities methods missing state patch endpoints: %#v", methods)
+	}
 	errResp := rpcCallExpectError(t, server.URL, "eth_call", []any{map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": "0x0000000000000000000000000000000000000044", "input": "0x"}})
 	if errResp == nil {
 		t.Fatal("expected eth_call to be rejected on dbgserver")
 	}
 	if errResp["message"] != "method eth_call not available on dbgserver" {
 		t.Fatalf("unexpected error response = %#v", errResp)
+	}
+}
+
+func TestGDBStatePatchExportImportCarryOver(t *testing.T) {
+	contract := engine.Address{19: 0x99}
+	slotZero := engine.Hash{}
+	initialValue := engine.Hash{31: 0x07}
+	provider := &stubProvider{
+		block:         upstream.Block{Number: big.NewInt(5), GasLimit: 1_000_000, BaseFee: big.NewInt(1), ChainID: big.NewInt(1)},
+		codeByAddress: map[engine.Address][]byte{contract: {0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}},
+		storageByAddr: map[engine.Address]map[engine.Hash]engine.Hash{contract: {slotZero: initialValue}},
+	}
+	engineRef, err := forkengine.New(forkengine.Config{Provider: provider, Fork: engine.ForkCancun, Block: upstream.BlockNumber(5)})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	server := httptest.NewServer(NewGDBServer(engineRef))
+	defer server.Close()
+
+	first := rpcCall(t, server.URL, "gdb.startCallSession", []any{map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": addressHex(contract), "input": "0x"}, "0x5"}).(map[string]any)
+	firstID := first["id"].(string)
+	_ = rpcCall(t, server.URL, "gdb.setStorageBreakpoint", []any{firstID, map[string]any{"slot": "0x0", "access": "read", "address": addressHex(contract)}})
+	paused := rpcCall(t, server.URL, "gdb.continue", []any{firstID}).(map[string]any)
+	current := paused["current"].(map[string]any)
+	if current["reason"] != "storage_read_breakpoint" {
+		t.Fatalf("pause reason = %v, want storage_read_breakpoint", current["reason"])
+	}
+	_ = rpcCall(t, server.URL, "gdb.writeStorage", []any{firstID, map[string]any{"slot": "0x0", "value": "0x2a", "address": addressHex(contract)}})
+	finished := rpcCall(t, server.URL, "gdb.continue", []any{firstID}).(map[string]any)
+	if done, ok := finished["done"].(bool); !ok || !done {
+		t.Fatalf("first session done = %#v, want true", finished["done"])
+	}
+
+	patch := rpcCall(t, server.URL, "gdb.exportStatePatch", []any{firstID, map[string]any{"scope": "all"}}).(map[string]any)
+	patchID, ok := patch["patchId"].(string)
+	if !ok || patchID == "" {
+		t.Fatalf("patchId = %#v", patch["patchId"])
+	}
+
+	second := rpcCall(t, server.URL, "gdb.startCallSession", []any{map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": addressHex(contract), "input": "0x"}, "0x5"}).(map[string]any)
+	secondID := second["id"].(string)
+	imported := rpcCall(t, server.URL, "gdb.importStatePatch", []any{secondID, map[string]any{"patches": []string{patchID}, "merge": "append"}}).(map[string]any)
+	applied := imported["applied"].([]any)
+	if len(applied) != 1 || applied[0] != patchID {
+		t.Fatalf("import applied = %#v, want [%q]", applied, patchID)
+	}
+
+	completed := rpcCall(t, server.URL, "gdb.continue", []any{secondID}).(map[string]any)
+	if done, ok := completed["done"].(bool); !ok || !done {
+		t.Fatalf("second session done = %#v, want true", completed["done"])
+	}
+	result := completed["result"].(map[string]any)
+	if result["returnData"] != "0x000000000000000000000000000000000000000000000000000000000000002a" {
+		t.Fatalf("returnData = %v, want 0x...2a", result["returnData"])
+	}
+}
+
+func TestGDBStatePatchImportRequiresSessionNotStarted(t *testing.T) {
+	contract := engine.Address{19: 0xa1}
+	provider := &stubProvider{
+		block:         upstream.Block{Number: big.NewInt(5), GasLimit: 1_000_000, BaseFee: big.NewInt(1), ChainID: big.NewInt(1)},
+		codeByAddress: map[engine.Address][]byte{contract: {0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}},
+	}
+	engineRef, err := forkengine.New(forkengine.Config{Provider: provider, Fork: engine.ForkCancun, Block: upstream.BlockNumber(5)})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	server := httptest.NewServer(NewGDBServer(engineRef))
+	defer server.Close()
+
+	base := rpcCall(t, server.URL, "gdb.startCallSession", []any{map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": addressHex(contract), "input": "0x"}, "0x5"}).(map[string]any)
+	baseID := base["id"].(string)
+	_ = rpcCall(t, server.URL, "gdb.setStorageBreakpoint", []any{baseID, map[string]any{"slot": "0x0", "access": "read", "address": addressHex(contract)}})
+	_ = rpcCall(t, server.URL, "gdb.continue", []any{baseID})
+	_ = rpcCall(t, server.URL, "gdb.writeStorage", []any{baseID, map[string]any{"slot": "0x0", "value": "0x1", "address": addressHex(contract)}})
+	patch := rpcCall(t, server.URL, "gdb.exportStatePatch", []any{baseID, map[string]any{"scope": "storage"}}).(map[string]any)
+	patchID := patch["patchId"].(string)
+
+	target := rpcCall(t, server.URL, "gdb.startCallSession", []any{map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": addressHex(contract), "input": "0x"}, "0x5"}).(map[string]any)
+	targetID := target["id"].(string)
+	_ = rpcCall(t, server.URL, "gdb.next", []any{targetID})
+	errResp := rpcCallExpectError(t, server.URL, "gdb.importStatePatch", []any{targetID, map[string]any{"patches": []string{patchID}}})
+	if errResp == nil {
+		t.Fatal("expected import to fail after session started")
+	}
+	if errResp["code"] != float64(-32602) {
+		t.Fatalf("error code = %#v, want -32602", errResp["code"])
+	}
+	if !strings.Contains(fmt.Sprint(errResp["message"]), "before first execution step") {
+		t.Fatalf("error message = %#v", errResp["message"])
+	}
+}
+
+func TestGDBSequenceSessionCarriesMutationsAcrossSteps(t *testing.T) {
+	contract := engine.Address{19: 0xa2}
+	slotZero := engine.Hash{}
+	initialValue := engine.Hash{31: 0x07}
+	provider := &stubProvider{
+		block:         upstream.Block{Number: big.NewInt(5), GasLimit: 1_000_000, BaseFee: big.NewInt(1), ChainID: big.NewInt(1)},
+		codeByAddress: map[engine.Address][]byte{contract: {0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}},
+		storageByAddr: map[engine.Address]map[engine.Hash]engine.Hash{contract: {slotZero: initialValue}},
+	}
+	engineRef, err := forkengine.New(forkengine.Config{Provider: provider, Fork: engine.ForkCancun, Block: upstream.BlockNumber(5)})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	server := httptest.NewServer(NewGDBServer(engineRef))
+	defer server.Close()
+
+	started := rpcCall(t, server.URL, "gdb.startSequenceSession", []any{map[string]any{
+		"stateCarry": "mutation-only",
+		"steps": []map[string]any{
+			{"kind": "call", "request": map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": addressHex(contract), "input": "0x"}, "block": "0x5"},
+			{"kind": "call", "request": map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": addressHex(contract), "input": "0x"}, "block": "0x5"},
+		},
+	}}).(map[string]any)
+	if started["stateCarry"] != "mutation-only" {
+		t.Fatalf("stateCarry = %#v, want mutation-only", started["stateCarry"])
+	}
+	activeSession := started["activeSession"].(map[string]any)
+	firstSessionID := activeSession["id"].(string)
+
+	_ = rpcCall(t, server.URL, "gdb.setStorageBreakpoint", []any{firstSessionID, map[string]any{"slot": "0x0", "access": "read", "address": addressHex(contract)}})
+	paused := rpcCall(t, server.URL, "gdb.continue", []any{firstSessionID}).(map[string]any)
+	current := paused["current"].(map[string]any)
+	if current["reason"] != "storage_read_breakpoint" {
+		t.Fatalf("pause reason = %v, want storage_read_breakpoint", current["reason"])
+	}
+	_ = rpcCall(t, server.URL, "gdb.writeStorage", []any{firstSessionID, map[string]any{"slot": "0x0", "value": "0x2a", "address": addressHex(contract)}})
+	firstCompleted := rpcCall(t, server.URL, "gdb.continue", []any{firstSessionID}).(map[string]any)
+	if done, ok := firstCompleted["done"].(bool); !ok || !done {
+		t.Fatalf("first step done = %#v, want true", firstCompleted["done"])
+	}
+
+	sequenceID := started["sequenceId"].(string)
+	advanced := rpcCall(t, server.URL, "gdb.nextStepSession", []any{sequenceID}).(map[string]any)
+	if advanced["currentStepIndex"].(float64) != 1 {
+		t.Fatalf("currentStepIndex = %#v, want 1", advanced["currentStepIndex"])
+	}
+	secondSession := advanced["activeSession"].(map[string]any)
+	secondSessionID := secondSession["id"].(string)
+	secondCompleted := rpcCall(t, server.URL, "gdb.continue", []any{secondSessionID}).(map[string]any)
+	if done, ok := secondCompleted["done"].(bool); !ok || !done {
+		t.Fatalf("second step done = %#v, want true", secondCompleted["done"])
+	}
+	result := secondCompleted["result"].(map[string]any)
+	if result["returnData"] != "0x000000000000000000000000000000000000000000000000000000000000002a" {
+		t.Fatalf("returnData = %v, want 0x...2a", result["returnData"])
+	}
+
+	finalState := rpcCall(t, server.URL, "gdb.nextStepSession", []any{sequenceID}).(map[string]any)
+	if done, ok := finalState["done"].(bool); !ok || !done {
+		t.Fatalf("sequence done = %#v, want true", finalState["done"])
+	}
+}
+
+func TestGDBSequenceSessionRejectsAdvanceWhenActiveStepNotDone(t *testing.T) {
+	contract := engine.Address{19: 0xa3}
+	provider := &stubProvider{
+		block:         upstream.Block{Number: big.NewInt(5), GasLimit: 1_000_000, BaseFee: big.NewInt(1), ChainID: big.NewInt(1)},
+		codeByAddress: map[engine.Address][]byte{contract: {0x60, 0x00, 0x54, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3}},
+	}
+	engineRef, err := forkengine.New(forkengine.Config{Provider: provider, Fork: engine.ForkCancun, Block: upstream.BlockNumber(5)})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	server := httptest.NewServer(NewGDBServer(engineRef))
+	defer server.Close()
+
+	started := rpcCall(t, server.URL, "gdb.startSequenceSession", []any{map[string]any{
+		"stateCarry": "full",
+		"steps": []map[string]any{
+			{"kind": "call", "request": map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": addressHex(contract), "input": "0x"}, "block": "0x5"},
+			{"kind": "call", "request": map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": addressHex(contract), "input": "0x"}, "block": "0x5"},
+		},
+	}}).(map[string]any)
+	if started["stateCarry"] != "mutation-only" {
+		t.Fatalf("effective carry = %#v, want mutation-only", started["stateCarry"])
+	}
+	if started["requestedStateCarry"] != "full" {
+		t.Fatalf("requested carry = %#v, want full", started["requestedStateCarry"])
+	}
+
+	errResp := rpcCallExpectError(t, server.URL, "gdb.nextStepSession", []any{started["sequenceId"].(string)})
+	if errResp == nil {
+		t.Fatal("expected nextStepSession to fail before active step completes")
+	}
+	if errResp["code"] != float64(-32602) {
+		t.Fatalf("error code = %#v, want -32602", errResp["code"])
+	}
+	if !strings.Contains(fmt.Sprint(errResp["message"]), "not completed") {
+		t.Fatalf("error message = %#v", errResp["message"])
+	}
+	data, ok := errResp["data"].(map[string]any)
+	if !ok || data["reason"] != "SEQUENCE_STEP_NOT_DONE" {
+		t.Fatalf("error data = %#v", errResp["data"])
 	}
 }
 
@@ -401,4 +613,13 @@ func rpcCallExpectError(t *testing.T, url string, method string, params []any) m
 		t.Fatalf("Decode() error = %v", err)
 	}
 	return decoded.Error
+}
+
+func containsAnyString(items []any, want string) bool {
+	for _, item := range items {
+		if text, ok := item.(string); ok && text == want {
+			return true
+		}
+	}
+	return false
 }

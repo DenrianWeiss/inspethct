@@ -19,11 +19,15 @@ import (
 )
 
 type Server struct {
-	engine    *forkengine.Engine
-	sessionID uint64
-	mu        sync.Mutex
-	sessions  map[string]*ReplaySession
-	mode      serverMode
+	engine     *forkengine.Engine
+	sessionID  uint64
+	patchID    uint64
+	sequenceID uint64
+	mu         sync.Mutex
+	sessions   map[string]*ReplaySession
+	patches    map[string]*StatePatch
+	sequences  map[string]*SequenceSession
+	mode       serverMode
 }
 
 type serverMode string
@@ -73,6 +77,7 @@ type response struct {
 type respError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
 }
 
 type callArgs struct {
@@ -86,11 +91,11 @@ type callArgs struct {
 }
 
 func NewServer(engineRef *forkengine.Engine) *Server {
-	return &Server{engine: engineRef, sessions: make(map[string]*ReplaySession), mode: serverModeFull}
+	return &Server{engine: engineRef, sessions: make(map[string]*ReplaySession), patches: make(map[string]*StatePatch), sequences: make(map[string]*SequenceSession), mode: serverModeFull}
 }
 
 func NewGDBServer(engineRef *forkengine.Engine) *Server {
-	return &Server{engine: engineRef, sessions: make(map[string]*ReplaySession), mode: serverModeGDBOnly}
+	return &Server{engine: engineRef, sessions: make(map[string]*ReplaySession), patches: make(map[string]*StatePatch), sequences: make(map[string]*SequenceSession), mode: serverModeGDBOnly}
 }
 
 func (server *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -226,6 +231,14 @@ func (server *Server) handle(ctx context.Context, req request) (any, *respError)
 		return server.writeStorage(req.Params)
 	case "gdb.writeMemory":
 		return server.writeMemory(req.Params)
+	case "gdb.exportStatePatch":
+		return server.exportStatePatch(req.Params)
+	case "gdb.importStatePatch":
+		return server.importStatePatch(req.Params)
+	case "gdb.startSequenceSession":
+		return server.startSequenceSession(ctx, req.Params)
+	case "gdb.nextStepSession":
+		return server.nextStepSession(ctx, req.Params)
 	default:
 		return nil, &respError{Code: -32601, Message: fmt.Sprintf("method %s not found", req.Method)}
 	}
@@ -236,7 +249,7 @@ func (server *Server) methodAllowed(method string) bool {
 		return true
 	}
 	switch method {
-	case "dbgserver.capabilities", "eth_chainId", "gdb.startReplaySession", "gdb.startCallSession", "gdb.next", "gdb.continue", "gdb.state", "gdb.loadSourceBundle", "gdb.setSourceBreakpoint", "gdb.setFunctionBreakpoint", "gdb.setCallBreakpoint", "gdb.setStorageBreakpoint", "gdb.setMemoryBreakpoint", "gdb.listBreakpoints", "gdb.deleteBreakpoint", "gdb.writeStorage", "gdb.writeMemory":
+	case "dbgserver.capabilities", "eth_chainId", "gdb.startReplaySession", "gdb.startCallSession", "gdb.next", "gdb.continue", "gdb.state", "gdb.loadSourceBundle", "gdb.setSourceBreakpoint", "gdb.setFunctionBreakpoint", "gdb.setCallBreakpoint", "gdb.setStorageBreakpoint", "gdb.setMemoryBreakpoint", "gdb.listBreakpoints", "gdb.deleteBreakpoint", "gdb.writeStorage", "gdb.writeMemory", "gdb.exportStatePatch", "gdb.importStatePatch", "gdb.startSequenceSession", "gdb.nextStepSession":
 		return true
 	default:
 		return false
@@ -262,10 +275,21 @@ func (server *Server) capabilities() map[string]any {
 			"gdb.deleteBreakpoint",
 			"gdb.writeStorage",
 			"gdb.writeMemory",
+			"gdb.exportStatePatch",
+			"gdb.importStatePatch",
+			"gdb.startSequenceSession",
+			"gdb.nextStepSession",
+		},
+		"features": map[string]any{
+			"statePatch":      true,
+			"sequenceSession": true,
+			"tupleAbiAssist":  false,
 		},
 		"notes": []string{
 			"dbgserver exposes replay and call debugging sessions",
 			"source, function, call, storage, and memory breakpoints are available over RPC",
+			"state patches can be exported and imported between sessions for multi-step carry-over",
+			"sequence sessions orchestrate multi-step call/replay flows with carry modes",
 		},
 	}
 }
