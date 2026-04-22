@@ -162,6 +162,7 @@ jobs:
         run: |
           VERSION_CLEAN="${{ steps.version.outputs.value }}"
           VERSION_CLEAN="${VERSION_CLEAN#v}"   # strip leading 'v' for semver
+          mkdir -p ../bin
           npx vsce package \
             --out "../bin/inspethct-${VERSION_CLEAN}.vsix" \
             --no-git-tag-version \
