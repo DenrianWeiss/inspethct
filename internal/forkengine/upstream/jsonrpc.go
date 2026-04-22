@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/big"
 	"net/http"
@@ -629,6 +630,7 @@ func (client *JSONRPCClient) doSingle(ctx context.Context, request rpcRequest) (
 
 func (client *JSONRPCClient) doWithRetry(ctx context.Context, payload any) ([]byte, error) {
 	var lastErr error
+	methods := payloadMethods(payload)
 	for attempt := 1; attempt <= client.retry.MaxAttempts; attempt++ {
 		if err := client.waitRateLimit(ctx); err != nil {
 			return nil, err
@@ -642,6 +644,7 @@ func (client *JSONRPCClient) doWithRetry(ctx context.Context, payload any) ([]by
 		} else {
 			lastErr = err
 		}
+		log.Printf("upstream json-rpc request failed: endpoint=%s methods=%s attempt=%d/%d status=%d err=%v body_prefix=%q", client.endpoint, methods, attempt, client.retry.MaxAttempts, status, lastErr, summarizeBodyPrefix(body, 240))
 		if attempt == client.retry.MaxAttempts || !shouldRetry(status, lastErr) {
 			break
 		}
@@ -681,7 +684,7 @@ func (client *JSONRPCClient) doHTTP(ctx context.Context, payload any) ([]byte, i
 	if response.StatusCode >= 400 && response.StatusCode < 500 && response.StatusCode != http.StatusTooManyRequests {
 		trimmed := bytes.TrimSpace(body)
 		if len(trimmed) > 0 && trimmed[0] != '[' && trimmed[0] != '{' {
-			return body, response.StatusCode, errBatchUnsupported
+			return body, response.StatusCode, fmt.Errorf("%w: status=%d body_prefix=%q", errBatchUnsupported, response.StatusCode, summarizeBodyPrefix(body, 240))
 		}
 	}
 	return body, response.StatusCode, nil
@@ -769,10 +772,49 @@ func classifyHTTPError(status int, body []byte) error {
 	if status >= 400 && status < 500 {
 		trimmed := bytes.TrimSpace(body)
 		if len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
-			return errBatchUnsupported
+			return fmt.Errorf("%w: status=%d body_prefix=%q", errBatchUnsupported, status, summarizeBodyPrefix(body, 240))
 		}
 	}
-	return fmt.Errorf("upstream: http status %d", status)
+	return fmt.Errorf("upstream: http status %d body_prefix=%q", status, summarizeBodyPrefix(body, 240))
+}
+
+func payloadMethods(payload any) string {
+	switch value := payload.(type) {
+	case rpcRequest:
+		if value.Method == "" {
+			return "<unknown>"
+		}
+		return value.Method
+	case []rpcRequest:
+		if len(value) == 0 {
+			return "<none>"
+		}
+		parts := make([]string, 0, len(value))
+		for _, request := range value {
+			method := strings.TrimSpace(request.Method)
+			if method == "" {
+				method = "<unknown>"
+			}
+			parts = append(parts, method)
+		}
+		return strings.Join(parts, ",")
+	default:
+		return "<unknown>"
+	}
+}
+
+func summarizeBodyPrefix(body []byte, limit int) string {
+	if limit <= 0 {
+		limit = 120
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) > limit {
+		return trimmed[:limit] + "..."
+	}
+	return trimmed
 }
 
 func cloneHeaders(headers map[string]string) map[string]string {
