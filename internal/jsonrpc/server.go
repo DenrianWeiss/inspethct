@@ -58,6 +58,10 @@ type ReplaySession struct {
 	RootInput    []byte                          `json:"-"`
 	LastStep     int                             `json:"-"`
 	PendingPause *ReplayPause                    `json:"-"`
+	// MemorySnapshot retains the full EVM memory at the most recent pause so
+	// that gdb.readMemory can serve random-access reads even when the inline
+	// pause payload was truncated for transport efficiency.
+	MemorySnapshot []byte `json:"-"`
 }
 
 type request struct {
@@ -241,6 +245,8 @@ func (server *Server) handle(ctx context.Context, req request) (any, *respError)
 		return server.writeStorage(req.Params)
 	case "gdb.writeMemory":
 		return server.writeMemory(req.Params)
+	case "gdb.readMemory":
+		return server.readMemory(req.Params)
 	case "gdb.exportStatePatch":
 		return server.exportStatePatch(req.Params)
 	case "gdb.importStatePatch":
@@ -273,6 +279,7 @@ var gdbMethodNames = []string{
 	"gdb.deleteBreakpoint",
 	"gdb.writeStorage",
 	"gdb.writeMemory",
+	"gdb.readMemory",
 	"gdb.exportStatePatch",
 	"gdb.importStatePatch",
 	"gdb.startSequenceSession",

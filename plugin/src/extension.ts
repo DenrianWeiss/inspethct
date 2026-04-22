@@ -133,6 +133,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("inspethct.openSequenceBuilder", async () => {
       await runOpenSequenceBuilderCommand(context);
     }),
+    vscode.commands.registerCommand("inspethct.openRepl", async () => {
+      await runReplCommand(context);
+    }),
     {
       dispose: () => processManager.stopAll()
     }
@@ -259,6 +262,40 @@ async function runOpenSequenceBuilderCommand(context: vscode.ExtensionContext): 
   SequenceBuilderPanel.open(context, defaults, async (config) => {
     await vscode.debug.startDebugging(folder, config);
   });
+}
+
+let replOutput: vscode.OutputChannel | undefined;
+
+async function runReplCommand(_context: vscode.ExtensionContext): Promise<void> {
+  const session = vscode.debug.activeDebugSession;
+  if (!session || session.type !== "inspethct") {
+    void vscode.window.showWarningMessage("Inspethct REPL requires an active Inspethct debug session.");
+    return;
+  }
+  if (!replOutput) {
+    replOutput = vscode.window.createOutputChannel("Inspethct REPL");
+  }
+  replOutput.show(true);
+  for (;;) {
+    const command = await vscode.window.showInputBox({
+      prompt: "inspethct>",
+      placeHolder: "help, c, n, b line ...:N, info locals, x 0x80 0x40, ...",
+      ignoreFocusOut: true
+    });
+    if (command === undefined || command.length === 0) {
+      return;
+    }
+    replOutput.appendLine(`> ${command}`);
+    try {
+      const reply = await session.customRequest("evaluate", { expression: command, context: "repl" });
+      const text = reply && typeof reply.result === "string" ? reply.result : JSON.stringify(reply);
+      if (text && text.length > 0) {
+        replOutput.appendLine(text);
+      }
+    } catch (error) {
+      replOutput.appendLine(`error: ${String(error)}`);
+    }
+  }
 }
 
 async function pickSequenceScriptUri(): Promise<vscode.Uri | undefined> {

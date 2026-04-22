@@ -22,7 +22,8 @@
     "onCommand:inspethct.debugContract",
     "onCommand:inspethct.importReplayFromChain",
     "onCommand:inspethct.runSequenceScript",
-    "onCommand:inspethct.openSequenceBuilder"
+    "onCommand:inspethct.openSequenceBuilder",
+    "onCommand:inspethct.openRepl"
   ],
   "contributes": {
     "breakpoints": [
@@ -219,6 +220,10 @@
       {
         "command": "inspethct.openSequenceBuilder",
         "title": "Inspethct: Open Sequence Builder"
+      },
+      {
+        "command": "inspethct.openRepl",
+        "title": "Inspethct: Open REPL"
       }
     ],
     "menus": {

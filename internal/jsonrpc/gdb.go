@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	gethabi "github.com/ethereum/go-ethereum/accounts/abi"
@@ -21,22 +22,58 @@ import (
 var errReplayPause = errors.New("jsonrpc: replay pause")
 
 type ReplayPause struct {
-	Reason          string                 `json:"reason"`
-	Breakpoint      string                 `json:"breakpoint,omitempty"`
-	StepIndex       int                    `json:"stepIndex"`
-	ContractAddress string                 `json:"contractAddress"`
-	CodeAddress     string                 `json:"codeAddress"`
-	Memory          string                 `json:"memory"`
-	MemorySize      int                    `json:"memorySize"`
-	Source          map[string]any         `json:"source,omitempty"`
-	Storage         []VariableValue        `json:"storage,omitempty"`
-	Transient       []VariableValue        `json:"transient,omitempty"`
-	CallAccess      *CallAccess            `json:"callAccess,omitempty"`
-	StorageAccess   *StorageAccess         `json:"storageAccess,omitempty"`
-	MemoryAccess    *MemoryAccess          `json:"memoryAccess,omitempty"`
-	Metadata        any                    `json:"metadata,omitempty"`
-	Step            forkengineTracePayload `json:"step"`
+	Reason            string                 `json:"reason"`
+	Breakpoint        string                 `json:"breakpoint,omitempty"`
+	StepIndex         int                    `json:"stepIndex"`
+	ContractAddress   string                 `json:"contractAddress"`
+	CodeAddress       string                 `json:"codeAddress"`
+	Memory            string                 `json:"memory"`
+	MemoryTruncated   bool                   `json:"memoryTruncated,omitempty"`
+	MemorySize        int                    `json:"memorySize"`
+	MemoryRegions     []MemoryRegionInfo     `json:"memoryRegions,omitempty"`
+	FreeMemoryPointer uint64                 `json:"freeMemoryPointer,omitempty"`
+	Stack             []string               `json:"stack,omitempty"`
+	Locals            []LocalVariable        `json:"locals,omitempty"`
+	Source            map[string]any         `json:"source,omitempty"`
+	Storage           []VariableValue        `json:"storage,omitempty"`
+	Transient         []VariableValue        `json:"transient,omitempty"`
+	CallAccess        *CallAccess            `json:"callAccess,omitempty"`
+	StorageAccess     *StorageAccess         `json:"storageAccess,omitempty"`
+	MemoryAccess      *MemoryAccess          `json:"memoryAccess,omitempty"`
+	Metadata          any                    `json:"metadata,omitempty"`
+	Step              forkengineTracePayload `json:"step"`
 }
+
+// MemoryRegionInfo describes a contiguous range of EVM memory with a
+// Solidity-aware label (scratch space, free memory pointer, zero slot,
+// heap, temporary).
+type MemoryRegionInfo struct {
+	Kind   string `json:"kind"`
+	Label  string `json:"label"`
+	Offset uint64 `json:"offset"`
+	Length uint64 `json:"length"`
+}
+
+// LocalVariable describes a local declared in scope at the current PC. The
+// Value field is best-effort: it is populated only when the variable can be
+// matched to a stack slot with high confidence (e.g. value-type parameter
+// without intervening branches). Otherwise Value is empty and Confidence is
+// "unavailable".
+type LocalVariable struct {
+	Name            string `json:"name"`
+	Type            string `json:"type"`
+	StorageLocation string `json:"storageLocation,omitempty"`
+	Kind            string `json:"kind"` // parameter | return | local
+	DeclaredAtLine  int    `json:"declaredAtLine,omitempty"`
+	Value           string `json:"value,omitempty"`
+	Confidence      string `json:"confidence,omitempty"` // resolved | unavailable
+	StackDepth      int    `json:"stackDepth,omitempty"`
+}
+
+// pauseInlineMemoryCap caps the memory blob that ships in pause payloads. The
+// plugin uses gdb.readMemory for paged access beyond this size to keep the
+// step latency low for contracts with large memory footprints.
+const pauseInlineMemoryCap = 4096
 
 type forkengineTracePayload struct {
 	PC           uint64 `json:"pc"`
@@ -519,12 +556,21 @@ func capturePause(session *ReplaySession, ctx *engine.HookContext, stepIndex int
 	codeAddr := ctx.State.ContractCodeAddr()
 	pause.ContractAddress = addressHex(contractAddr)
 	pause.CodeAddress = addressHex(codeAddr)
-	pause.Memory = encodeMemory(ctx.State)
 	pause.MemorySize = ctx.State.MemoryLen()
+	if pause.MemorySize > 0 {
+		session.MemorySnapshot = append(session.MemorySnapshot[:0], ctx.State.MemoryGet(0, uint64(pause.MemorySize))...)
+	} else {
+		session.MemorySnapshot = session.MemorySnapshot[:0]
+	}
+	pause.Memory, pause.MemoryTruncated = encodeMemoryCapped(ctx.State, pauseInlineMemoryCap)
+	pause.MemoryRegions = describeMemoryRegions(ctx.State)
+	pause.FreeMemoryPointer = readFreeMemoryPointer(ctx.State)
+	pause.Stack = encodeStackSnapshot(ctx.State)
 	if bundle := bundleForCodeAddress(session, codeAddr); bundle != nil {
 		pause.Metadata = bundle.Metadata
 		if ctx.Opcode != nil {
 			pause.Source = sourceForPC(bundle.Index, ctx.Opcode.PC)
+			pause.Locals = collectLocalsAtPC(bundle.Index, ctx, ctx.Opcode.PC)
 		}
 		pause.Storage = variablesForScope(ctx.State, contractAddr, bundle.Metadata.PersistentStorage, string(srcmap.StorageScopePersistent))
 		pause.Transient = variablesForScope(ctx.State, contractAddr, bundle.Metadata.TransientStorage, string(srcmap.StorageScopeTransient))
@@ -532,11 +578,101 @@ func capturePause(session *ReplaySession, ctx *engine.HookContext, stepIndex int
 	return pause
 }
 
-func encodeMemory(state engine.ReadOnlyState) string {
+func encodeMemoryCapped(state engine.ReadOnlyState, cap int) (string, bool) {
 	if state == nil || state.MemoryLen() == 0 {
-		return "0x"
+		return "0x", false
 	}
-	return encodeBytes(state.MemoryGet(0, uint64(state.MemoryLen())))
+	size := state.MemoryLen()
+	if cap > 0 && size > cap {
+		return encodeBytes(state.MemoryGet(0, uint64(cap))), true
+	}
+	return encodeBytes(state.MemoryGet(0, uint64(size))), false
+}
+
+func encodeStackSnapshot(state engine.ReadOnlyState) []string {
+	if state == nil {
+		return nil
+	}
+	n := state.StackLen()
+	if n == 0 {
+		return nil
+	}
+	out := make([]string, n)
+	for i := 0; i < n; i++ {
+		word := state.StackPeekN(i)
+		out[i] = encodeHash(engine.Hash(word))
+	}
+	return out
+}
+
+func readFreeMemoryPointer(state engine.ReadOnlyState) uint64 {
+	if state == nil || state.MemoryLen() < 0x60 {
+		return 0
+	}
+	data := state.MemoryGet(0x40, 32)
+	if len(data) != 32 {
+		return 0
+	}
+	// Free memory pointer occupies the low 8 bytes of word at 0x40 in practice.
+	var v uint64
+	for i := 24; i < 32; i++ {
+		v = (v << 8) | uint64(data[i])
+	}
+	return v
+}
+
+func describeMemoryRegions(state engine.ReadOnlyState) []MemoryRegionInfo {
+	if state == nil {
+		return nil
+	}
+	size := uint64(state.MemoryLen())
+	if size == 0 {
+		return nil
+	}
+	regions := make([]MemoryRegionInfo, 0, 4)
+	appendRegion := func(kind srcmap.MemoryRegionKind, start, end uint64) {
+		if end <= start || start >= size {
+			return
+		}
+		if end > size {
+			end = size
+		}
+		regions = append(regions, MemoryRegionInfo{Kind: string(kind), Label: memoryRegionLabel(kind), Offset: start, Length: end - start})
+	}
+	appendRegion(srcmap.MemoryRegionScratch, 0, 0x40)
+	appendRegion(srcmap.MemoryRegionFreePtr, 0x40, 0x60)
+	appendRegion(srcmap.MemoryRegionZeroSlot, 0x60, 0x80)
+	freePtr := readFreeMemoryPointer(state)
+	if freePtr > 0x80 && freePtr <= size {
+		appendRegion(srcmap.MemoryRegionHeap, 0x80, freePtr)
+		if freePtr < size {
+			appendRegion(srcmap.MemoryRegionTemporary, freePtr, size)
+		}
+	} else {
+		appendRegion(srcmap.MemoryRegionHeap, 0x80, size)
+	}
+	return regions
+}
+
+func memoryRegionLabel(kind srcmap.MemoryRegionKind) string {
+	switch kind {
+	case srcmap.MemoryRegionScratch:
+		return "scratch space"
+	case srcmap.MemoryRegionFreePtr:
+		return "free memory pointer"
+	case srcmap.MemoryRegionZeroSlot:
+		return "zero slot"
+	case srcmap.MemoryRegionHeap:
+		return "heap"
+	case srcmap.MemoryRegionTemporary:
+		return "temporary (above free ptr)"
+	}
+	return string(kind)
+}
+
+func encodeMemory(state engine.ReadOnlyState) string {
+	data, _ := encodeMemoryCapped(state, 0)
+	return data
 }
 
 func variablesForScope(state engine.ReadOnlyState, contractAddr engine.Address, mappings []srcmap.StorageVariableMapping, scope string) []VariableValue {
@@ -583,6 +719,252 @@ func sourceForPC(index *srcmap.Index, pc uint64) map[string]any {
 		result["nodeName"] = mapping.AST.Name
 	}
 	return result
+}
+
+// collectLocalsAtPC walks the AST upward from the deepest node covering the
+// current PC, locating the enclosing FunctionDefinition / ModifierDefinition,
+// and returns parameters, return parameters, and locally declared variables
+// that source-textually precede the current execution point. Values are
+// best-effort and currently always reported as unavailable until per-step
+// stack-slot tracking is implemented.
+func collectLocalsAtPC(index *srcmap.Index, ctx *engine.HookContext, pc uint64) []LocalVariable {
+	if index == nil || ctx == nil {
+		return nil
+	}
+	mapping, ok := index.InstructionAtPC(pc)
+	if !ok || mapping.Source.SourceID < 0 {
+		return nil
+	}
+	enclosing := findEnclosingFunctionLikeNode(index, mapping.AST)
+	if enclosing == nil {
+		// Fall back to scanning by source range when the instruction's AST
+		// pointer lies outside the indexed nodes (e.g. compiler-generated).
+		enclosing = findEnclosingFunctionLikeBySource(index, mapping.Source)
+	}
+	if enclosing == nil {
+		return nil
+	}
+	currentStart := mapping.Source.Start
+	file := index.Sources[mapping.Source.SourceID]
+	locals := make([]LocalVariable, 0)
+
+	// Parameters and return parameters.
+	for _, group := range []struct {
+		key  string
+		kind string
+	}{{"parameters", "parameter"}, {"returnParameters", "return"}} {
+		params := paramListFrom(enclosing.Raw, group.key)
+		for _, decl := range params {
+			locals = appendLocal(locals, decl, group.kind, currentStart, file, false)
+		}
+	}
+
+	// Variables declared in the body that source-textually precede the PC.
+	walkASTRaw(enclosing.Raw, func(node map[string]any) bool {
+		nodeType, _ := node["nodeType"].(string)
+		if nodeType != "VariableDeclaration" {
+			return true
+		}
+		// Skip the parameter / return declarations already handled above.
+		src, ok := parseSrcAttr(node["src"])
+		if !ok {
+			return true
+		}
+		if src.Start >= currentStart {
+			return false // declared after current PC; ignore (and stop nested walk)
+		}
+		// Skip declarations that belong to a parameter list of a nested
+		// function or event (we only want this function's body locals).
+		if isInsideParameterList(enclosing.Raw, node) {
+			return true
+		}
+		locals = appendLocal(locals, node, "local", currentStart, file, true)
+		return true
+	})
+	return locals
+}
+
+func findEnclosingFunctionLikeNode(index *srcmap.Index, node *srcmap.ASTNode) *srcmap.ASTNode {
+	for current := node; current != nil; {
+		switch current.NodeType {
+		case "FunctionDefinition", "ModifierDefinition":
+			return current
+		}
+		if current.ParentID == 0 {
+			return nil
+		}
+		parent, ok := index.NodesByID[current.ParentID]
+		if !ok || parent == current {
+			return nil
+		}
+		current = parent
+	}
+	return nil
+}
+
+func findEnclosingFunctionLikeBySource(index *srcmap.Index, src srcmap.SourceRange) *srcmap.ASTNode {
+	var best *srcmap.ASTNode
+	for _, node := range index.NodesBySourceID[src.SourceID] {
+		switch node.NodeType {
+		case "FunctionDefinition", "ModifierDefinition":
+		default:
+			continue
+		}
+		if node.Src.Start > src.Start || node.Src.End() < src.End() {
+			continue
+		}
+		if best == nil || node.Src.Length < best.Src.Length {
+			best = node
+		}
+	}
+	return best
+}
+
+func paramListFrom(raw map[string]any, key string) []map[string]any {
+	if raw == nil {
+		return nil
+	}
+	list, ok := raw[key].(map[string]any)
+	if !ok {
+		return nil
+	}
+	params, ok := list["parameters"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(params))
+	for _, item := range params {
+		if decl, ok := item.(map[string]any); ok {
+			out = append(out, decl)
+		}
+	}
+	return out
+}
+
+func appendLocal(locals []LocalVariable, decl map[string]any, kind string, currentStart int, file *srcmap.SourceFile, requireBeforePC bool) []LocalVariable {
+	name, _ := decl["name"].(string)
+	if name == "" {
+		return locals
+	}
+	src, ok := parseSrcAttr(decl["src"])
+	if !ok {
+		return locals
+	}
+	if requireBeforePC && src.Start >= currentStart {
+		return locals
+	}
+	typeStr := ""
+	if td, ok := decl["typeDescriptions"].(map[string]any); ok {
+		typeStr, _ = td["typeString"].(string)
+	}
+	if typeStr == "" {
+		if tn, ok := decl["typeName"].(map[string]any); ok {
+			if td, ok := tn["typeDescriptions"].(map[string]any); ok {
+				typeStr, _ = td["typeString"].(string)
+			}
+		}
+	}
+	storageLoc, _ := decl["storageLocation"].(string)
+	if storageLoc == "" || storageLoc == "default" {
+		storageLoc = "stack"
+	}
+	line := 0
+	if file != nil {
+		l, _ := file.LineColumnForOffset(src.Start)
+		line = l
+	}
+	return append(locals, LocalVariable{
+		Name:            name,
+		Type:            typeStr,
+		StorageLocation: storageLoc,
+		Kind:            kind,
+		DeclaredAtLine:  line,
+		Confidence:      "unavailable",
+	})
+}
+
+func parseSrcAttr(value any) (srcmap.SourceRange, bool) {
+	str, ok := value.(string)
+	if !ok {
+		return srcmap.SourceRange{}, false
+	}
+	parts := strings.Split(str, ":")
+	if len(parts) < 3 {
+		return srcmap.SourceRange{}, false
+	}
+	start, err1 := strconv.Atoi(parts[0])
+	length, err2 := strconv.Atoi(parts[1])
+	fileID, err3 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return srcmap.SourceRange{}, false
+	}
+	return srcmap.SourceRange{SourceID: fileID, Start: start, Length: length}, true
+}
+
+func walkASTRaw(node map[string]any, visit func(map[string]any) bool) {
+	if node == nil {
+		return
+	}
+	if !visit(node) {
+		return
+	}
+	for _, value := range node {
+		switch typed := value.(type) {
+		case map[string]any:
+			if _, hasID := typed["id"]; hasID {
+				walkASTRaw(typed, visit)
+			}
+		case []any:
+			for _, item := range typed {
+				if child, ok := item.(map[string]any); ok {
+					if _, hasID := child["id"]; hasID {
+						walkASTRaw(child, visit)
+					}
+				}
+			}
+		}
+	}
+}
+
+func isInsideParameterList(funcRaw, target map[string]any) bool {
+	for _, key := range []string{"parameters", "returnParameters"} {
+		list, ok := funcRaw[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		params, ok := list["parameters"].([]any)
+		if !ok {
+			continue
+		}
+		for _, item := range params {
+			if reflectSameMap(item, target) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func reflectSameMap(a any, b map[string]any) bool {
+	m, ok := a.(map[string]any)
+	if !ok {
+		return false
+	}
+	idA, okA := asJSONNumber(m["id"])
+	idB, okB := asJSONNumber(b["id"])
+	return okA && okB && idA == idB
+}
+
+func asJSONNumber(v any) (float64, bool) {
+	switch typed := v.(type) {
+	case float64:
+		return typed, true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	}
+	return 0, false
 }
 
 func bundleForCodeAddress(session *ReplaySession, codeAddr engine.Address) *contractmeta.Bundle {
@@ -992,7 +1374,56 @@ func (server *Server) writeMemory(params []json.RawMessage) (any, *respError) {
 	mutation := ReplayMutation{Kind: "memory", StepIndex: session.Position, Offset: request.Offset, Data: encodeBytes(data)}
 	session.Mutations = append(session.Mutations, mutation)
 	applyMemoryMutationToPause(session.Current, mutation)
+	applyMemoryMutationToSnapshot(session, mutation)
 	return server.describeSession(session), nil
+}
+
+type readMemoryRequest struct {
+	Offset uint64 `json:"offset"`
+	Length uint64 `json:"length"`
+}
+
+func (server *Server) readMemory(params []json.RawMessage) (any, *respError) {
+	session, request, rpcErr := decodeSessionAndRequest[readMemoryRequest](server, params)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if session.Current == nil {
+		return nil, &respError{Code: -32602, Message: "session is not paused"}
+	}
+	total := uint64(len(session.MemorySnapshot))
+	if request.Offset > total {
+		return map[string]any{"offset": request.Offset, "length": 0, "data": "0x", "memorySize": total, "truncated": false}, nil
+	}
+	end := request.Offset + request.Length
+	if request.Length == 0 || end > total {
+		end = total
+	}
+	chunk := append([]byte(nil), session.MemorySnapshot[request.Offset:end]...)
+	return map[string]any{
+		"offset":     request.Offset,
+		"length":     uint64(len(chunk)),
+		"data":       encodeBytes(chunk),
+		"memorySize": total,
+		"truncated":  end < request.Offset+request.Length,
+	}, nil
+}
+
+func applyMemoryMutationToSnapshot(session *ReplaySession, mutation ReplayMutation) {
+	if session == nil {
+		return
+	}
+	data, err := decodeBytes(mutation.Data)
+	if err != nil || len(data) == 0 {
+		return
+	}
+	end := int(mutation.Offset) + len(data)
+	if end > len(session.MemorySnapshot) {
+		expanded := make([]byte, end)
+		copy(expanded, session.MemorySnapshot)
+		session.MemorySnapshot = expanded
+	}
+	copy(session.MemorySnapshot[int(mutation.Offset):], data)
 }
 
 func applyStorageMutationToPause(pause *ReplayPause, mutation ReplayMutation) {

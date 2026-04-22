@@ -15,6 +15,7 @@ import { DebugProtocol } from "@vscode/debugprotocol";
 import { InspethctLaunchConfig } from "../types";
 import { InspethctRuntime } from "./runtime";
 import { DbgserverProcessManager } from "../services/processManager";
+import { runRepl } from "./repl";
 
 const THREAD_ID = 1;
 
@@ -49,7 +50,8 @@ export class InspethctDebugSession extends LoggingDebugSession {
     response.body = {
       supportsConfigurationDoneRequest: true,
       supportsSetVariable: false,
-      supportsEvaluateForHovers: false
+      supportsEvaluateForHovers: true,
+      supportsReadMemoryRequest: true
     };
     this.sendResponse(response);
     this.sendEvent(new InitializedEvent());
@@ -308,9 +310,21 @@ export class InspethctDebugSession extends LoggingDebugSession {
 
     const scopes = [
       new Scope("Step", this.variableHandles.create({ title: "step", content: current?.step ?? {} }), false),
-      new Scope("Storage", this.variableHandles.create({ title: "storage", content: current?.storage ?? [] }), false),
-      new Scope("Transient", this.variableHandles.create({ title: "transient", content: current?.transient ?? [] }), false),
-      new Scope("Memory", this.variableHandles.create({ title: "memory", content: { memory: current?.memory, memorySize: current?.memorySize } }), false),
+      new Scope("Locals", this.variableHandles.create({ title: "locals", content: { kind: "locals", locals: current?.locals ?? [] } }), false),
+      new Scope("Storage", this.variableHandles.create({ title: "storage", content: { kind: "storage-list", entries: current?.storage ?? [] } }), false),
+      new Scope("Transient", this.variableHandles.create({ title: "transient", content: { kind: "storage-list", entries: current?.transient ?? [] } }), false),
+      new Scope("Memory", this.variableHandles.create({
+        title: "memory",
+        content: {
+          kind: "memory-root",
+          memory: current?.memory,
+          memorySize: current?.memorySize ?? 0,
+          truncated: current?.memoryTruncated === true,
+          regions: current?.memoryRegions ?? [],
+          freeMemoryPointer: current?.freeMemoryPointer ?? 0
+        }
+      }), false),
+      new Scope("Stack", this.variableHandles.create({ title: "stack", content: { kind: "stack", values: current?.stack ?? [] } }), false),
       new Scope("Access", this.variableHandles.create({
         title: "access",
         content: {
@@ -335,10 +349,229 @@ export class InspethctDebugSession extends LoggingDebugSession {
       this.sendResponse(response);
       return;
     }
-
-    const variables = flattenObject(bag.content);
+    const variables = this.renderVariables(bag.content);
     response.body = { variables };
     this.sendResponse(response);
+  }
+
+  private renderVariables(content: unknown): DebugProtocol.Variable[] {
+    if (content && typeof content === "object" && !Array.isArray(content)) {
+      const tagged = content as { kind?: string };
+      switch (tagged.kind) {
+        case "memory-root":
+          return this.renderMemoryRoot(content as MemoryRootBag);
+        case "memory-region":
+          return this.renderMemoryRegion(content as MemoryRegionBag);
+        case "memory-words":
+          return this.renderMemoryWords(content as MemoryWordsBag);
+        case "stack":
+          return this.renderStack(content as StackBag);
+        case "locals":
+          return this.renderLocals(content as LocalsBag);
+        case "storage-list":
+          return this.renderStorageList(content as StorageListBag);
+        case "storage-entry":
+          return this.renderStorageEntry(content as StorageEntryBag);
+      }
+    }
+    return flattenObject(content);
+  }
+
+  private renderMemoryRoot(bag: MemoryRootBag): DebugProtocol.Variable[] {
+    const variables: DebugProtocol.Variable[] = [];
+    variables.push({
+      name: "size",
+      value: `${bag.memorySize} bytes${bag.truncated ? " (inline truncated; use readMemory)" : ""}`,
+      variablesReference: 0
+    });
+    variables.push({
+      name: "freeMemoryPointer",
+      value: `0x${bag.freeMemoryPointer.toString(16)}`,
+      variablesReference: 0
+    });
+    for (const region of bag.regions) {
+      const ref = this.variableHandles.create({
+        title: region.label,
+        content: {
+          kind: "memory-region",
+          region
+        } satisfies MemoryRegionBag
+      });
+      variables.push({
+        name: region.label,
+        value: `[0x${region.offset.toString(16)} +${region.length}]`,
+        variablesReference: ref,
+        memoryReference: `mem:${region.offset}:${region.length}`
+      });
+    }
+    if (bag.regions.length === 0 && bag.memorySize > 0) {
+      const ref = this.variableHandles.create({
+        title: "memory",
+        content: { kind: "memory-words", offset: 0, length: bag.memorySize } satisfies MemoryWordsBag
+      });
+      variables.push({
+        name: "memory",
+        value: `${bag.memorySize} bytes`,
+        variablesReference: ref,
+        memoryReference: `mem:0:${bag.memorySize}`
+      });
+    }
+    return variables;
+  }
+
+  private renderMemoryRegion(bag: MemoryRegionBag): DebugProtocol.Variable[] {
+    const wordsRef = this.variableHandles.create({
+      title: bag.region.label,
+      content: { kind: "memory-words", offset: bag.region.offset, length: bag.region.length } satisfies MemoryWordsBag
+    });
+    return [
+      { name: "kind", value: bag.region.kind, variablesReference: 0 },
+      { name: "offset", value: `0x${bag.region.offset.toString(16)}`, variablesReference: 0 },
+      { name: "length", value: `${bag.region.length}`, variablesReference: 0 },
+      {
+        name: "words",
+        value: `${Math.ceil(bag.region.length / 32)} x 32-byte words`,
+        variablesReference: wordsRef,
+        memoryReference: `mem:${bag.region.offset}:${bag.region.length}`
+      }
+    ];
+  }
+
+  private renderMemoryWords(bag: MemoryWordsBag): DebugProtocol.Variable[] {
+    const state = this.runtime?.getState();
+    const memHex = state?.current?.memory ?? "0x";
+    const inline = hexToBytes(memHex);
+    const variables: DebugProtocol.Variable[] = [];
+    const end = bag.offset + bag.length;
+    for (let off = bag.offset; off < end; off += 32) {
+      const remain = Math.min(32, end - off);
+      const slice = off + remain <= inline.length
+        ? inline.subarray(off, off + remain)
+        : null;
+      const value = slice
+        ? `0x${bufferToHex(slice)}`
+        : `<paged: readMemory>`;
+      variables.push({
+        name: `0x${off.toString(16).padStart(4, "0")}`,
+        value,
+        variablesReference: 0,
+        memoryReference: `mem:${off}:${remain}`
+      });
+    }
+    return variables;
+  }
+
+  private renderStack(bag: StackBag): DebugProtocol.Variable[] {
+    return bag.values.map((value, index) => ({
+      name: index === 0 ? "top" : `[${index}]`,
+      value,
+      variablesReference: 0
+    }));
+  }
+
+  private renderLocals(bag: LocalsBag): DebugProtocol.Variable[] {
+    if (bag.locals.length === 0) {
+      return [{ name: "<no locals>", value: "AST scope unavailable at current PC", variablesReference: 0 }];
+    }
+    return bag.locals.map((local) => {
+      const value = local.value && local.value.length > 0
+        ? local.value
+        : `<${local.confidence || "unavailable"}>`;
+      const display = `${local.kind} ${local.type}${local.storageLocation && local.storageLocation !== "stack" ? ` (${local.storageLocation})` : ""}`;
+      return {
+        name: local.name,
+        value: `${display} = ${value}${local.declaredAtLine ? `  // L${local.declaredAtLine}` : ""}`,
+        variablesReference: 0
+      };
+    });
+  }
+
+  private renderStorageList(bag: StorageListBag): DebugProtocol.Variable[] {
+    if (bag.entries.length === 0) {
+      return [{ name: "<no entries>", value: "", variablesReference: 0 }];
+    }
+    return bag.entries.map((entry) => {
+      const ref = this.variableHandles.create({
+        title: entry.name,
+        content: { kind: "storage-entry", entry } satisfies StorageEntryBag
+      });
+      const decoded = decodeStorageValue(entry);
+      return {
+        name: entry.name || entry.slot,
+        type: entry.type,
+        value: decoded,
+        variablesReference: ref
+      };
+    });
+  }
+
+  private renderStorageEntry(bag: StorageEntryBag): DebugProtocol.Variable[] {
+    const entry = bag.entry;
+    return [
+      { name: "slot", value: entry.slot, variablesReference: 0 },
+      { name: "raw", value: entry.value, variablesReference: 0 },
+      { name: "type", value: entry.type ?? "unknown", variablesReference: 0 },
+      { name: "decoded", value: decodeStorageValue(entry), variablesReference: 0 }
+    ];
+  }
+
+  protected async readMemoryRequest(
+    response: DebugProtocol.ReadMemoryResponse,
+    args: DebugProtocol.ReadMemoryArguments
+  ): Promise<void> {
+    try {
+      const parsed = parseMemoryReference(args.memoryReference);
+      const baseOffset = parsed?.offset ?? 0;
+      const offset = baseOffset + (args.offset ?? 0);
+      const count = args.count;
+      const result = await this.runtime!.readMemory(offset, count);
+      const data = hexToBytes(result.data);
+      response.body = {
+        address: `0x${offset.toString(16)}`,
+        data: Buffer.from(data).toString("base64"),
+        unreadableBytes: Math.max(0, count - data.length)
+      };
+      this.sendResponse(response);
+    } catch (error) {
+      response.success = false;
+      response.message = String(error);
+      this.sendResponse(response);
+    }
+  }
+
+  protected async evaluateRequest(
+    response: DebugProtocol.EvaluateResponse,
+    args: DebugProtocol.EvaluateArguments
+  ): Promise<void> {
+    if (!this.runtime) {
+      response.success = false;
+      response.message = "runtime not started";
+      this.sendResponse(response);
+      return;
+    }
+    try {
+      const text = await runRepl(args.expression, this.runtime, (line) => {
+        this.sendEvent(new OutputEvent(`${line}\n`, "console"));
+      });
+      response.body = {
+        result: text,
+        variablesReference: 0
+      };
+      this.sendResponse(response);
+      // Refresh stopped state if a continue/step was issued.
+      if (/^(c|continue|n|s|step|next)\b/i.test(args.expression.trim())) {
+        const state = this.runtime.getState();
+        if (state?.done && !state.current) {
+          this.sendEvent(new TerminatedEvent());
+        } else {
+          this.sendEvent(new StoppedEvent(state?.current?.reason || "breakpoint", THREAD_ID));
+        }
+      }
+    } catch (error) {
+      response.success = false;
+      response.message = String(error);
+      this.sendResponse(response);
+    }
   }
 
   private async waitForConfigurationDone(): Promise<void> {
@@ -391,4 +624,113 @@ function normalizeValue(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+interface MemoryRootBag {
+  kind: "memory-root";
+  memory?: string;
+  memorySize: number;
+  truncated: boolean;
+  regions: { kind: string; label: string; offset: number; length: number }[];
+  freeMemoryPointer: number;
+}
+
+interface MemoryRegionBag {
+  kind: "memory-region";
+  region: { kind: string; label: string; offset: number; length: number };
+}
+
+interface MemoryWordsBag {
+  kind: "memory-words";
+  offset: number;
+  length: number;
+}
+
+interface StackBag {
+  kind: "stack";
+  values: string[];
+}
+
+interface LocalsBag {
+  kind: "locals";
+  locals: import("./runtime").LocalVariable[];
+}
+
+interface StorageListBag {
+  kind: "storage-list";
+  entries: import("./runtime").StorageVariable[];
+}
+
+interface StorageEntryBag {
+  kind: "storage-entry";
+  entry: import("./runtime").StorageVariable;
+}
+
+function hexToBytes(hex: string | undefined): Uint8Array {
+  if (!hex || !hex.startsWith("0x")) {
+    return new Uint8Array(0);
+  }
+  const stripped = hex.slice(2);
+  if (stripped.length === 0) {
+    return new Uint8Array(0);
+  }
+  const padded = stripped.length % 2 === 0 ? stripped : "0" + stripped;
+  const out = new Uint8Array(padded.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(padded.substr(i * 2, 2), 16);
+  }
+  return out;
+}
+
+function bufferToHex(buffer: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < buffer.length; i++) {
+    s += buffer[i].toString(16).padStart(2, "0");
+  }
+  return s;
+}
+
+function parseMemoryReference(ref: string | undefined): { offset: number; length: number } | undefined {
+  if (!ref || !ref.startsWith("mem:")) {
+    return undefined;
+  }
+  const parts = ref.slice(4).split(":");
+  if (parts.length < 1) {
+    return undefined;
+  }
+  const offset = Number(parts[0]);
+  const length = parts.length > 1 ? Number(parts[1]) : 0;
+  if (Number.isNaN(offset) || Number.isNaN(length)) {
+    return undefined;
+  }
+  return { offset, length };
+}
+
+function decodeStorageValue(entry: import("./runtime").StorageVariable): string {
+  const raw = entry.value || "0x";
+  const type = (entry.type || "").toLowerCase();
+  const bytes = hexToBytes(raw);
+  if (bytes.length === 0) {
+    return raw;
+  }
+  if (type.startsWith("address")) {
+    if (bytes.length >= 20) {
+      const slice = bytes.subarray(bytes.length - 20);
+      return `0x${bufferToHex(slice)}`;
+    }
+  }
+  if (type === "bool" || type === "t_bool") {
+    return bytes[bytes.length - 1] === 0 ? "false" : "true";
+  }
+  if (type.startsWith("uint") || type.startsWith("int") || type.startsWith("t_uint") || type.startsWith("t_int")) {
+    try {
+      const big = BigInt(raw);
+      return type.startsWith("int")
+        ? big.toString()
+        : `${big.toString()} (0x${big.toString(16)})`;
+    } catch {
+      return raw;
+    }
+  }
+  return raw;
 }

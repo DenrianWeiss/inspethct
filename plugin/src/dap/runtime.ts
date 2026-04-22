@@ -18,6 +18,32 @@ export interface RuntimeNotifier {
   warn(message: string): void;
 }
 
+export interface MemoryRegionInfo {
+  kind: string;
+  label: string;
+  offset: number;
+  length: number;
+}
+
+export interface StorageVariable {
+  scope?: string;
+  name: string;
+  slot: string;
+  value: string;
+  type?: string;
+}
+
+export interface LocalVariable {
+  name: string;
+  type: string;
+  storageLocation?: string;
+  kind: string; // "parameter" | "return" | "local"
+  declaredAtLine?: number;
+  value?: string;
+  confidence?: string;
+  stackDepth?: number;
+}
+
 export interface GdbSessionState {
   kind: "replay" | "call";
   id: string;
@@ -42,8 +68,13 @@ export interface GdbSessionState {
     };
     memory?: string;
     memorySize?: number;
-    storage?: unknown[];
-    transient?: unknown[];
+    memoryTruncated?: boolean;
+    memoryRegions?: MemoryRegionInfo[];
+    freeMemoryPointer?: number;
+    stack?: string[];
+    locals?: LocalVariable[];
+    storage?: StorageVariable[];
+    transient?: StorageVariable[];
     callAccess?: unknown;
     storageAccess?: unknown;
     memoryAccess?: unknown;
@@ -146,6 +177,22 @@ export class InspethctRuntime {
     this.ensureRpc();
     this.lastState = await this.rpc!.call<GdbSessionState>("gdb.state", [this.sessionId]);
     return this.lastState;
+  }
+
+  /** Generic JSON-RPC passthrough used by the REPL command surface. */
+  async rawCall<T = unknown>(method: string, params: unknown[]): Promise<T> {
+    this.ensureRpc();
+    return this.rpc!.call<T>(method, params);
+  }
+
+  /** Returns the current session id (empty string if not started). */
+  get currentSessionId(): string {
+    return this.sessionId;
+  }
+
+  async readMemory(offset: number, length: number): Promise<{ data: string; offset: number; length: number; memorySize: number; truncated: boolean }> {
+    this.ensureRpc();
+    return this.rpc!.call("gdb.readMemory", [this.sessionId, { offset, length }]);
   }
 
   async next(): Promise<GdbSessionState> {
