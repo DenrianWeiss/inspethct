@@ -10,6 +10,7 @@ import {
   Handles,
   Breakpoint
 } from "@vscode/debugadapter";
+import * as path from "node:path";
 import { DebugProtocol } from "@vscode/debugprotocol";
 import { InspethctLaunchConfig } from "../types";
 import { InspethctRuntime } from "./runtime";
@@ -27,7 +28,8 @@ export class InspethctDebugSession extends LoggingDebugSession {
   private runtime?: InspethctRuntime;
   private readonly variableHandles = new Handles<VariableBag>();
   private readonly pendingBreakpoints = new Map<string, number[]>();
-  private configurationDone = false;
+  private readonly configurationDonePromise: Promise<void>;
+  private resolveConfigurationDone?: () => void;
   private readonly processKey: string;
 
   constructor(private readonly processManager: DbgserverProcessManager) {
@@ -35,6 +37,9 @@ export class InspethctDebugSession extends LoggingDebugSession {
     this.setDebuggerLinesStartAt1(true);
     this.setDebuggerColumnsStartAt1(true);
     this.processKey = `inspethct-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+    this.configurationDonePromise = new Promise<void>((resolve) => {
+      this.resolveConfigurationDone = resolve;
+    });
   }
 
   protected initializeRequest(
@@ -54,7 +59,7 @@ export class InspethctDebugSession extends LoggingDebugSession {
     response: DebugProtocol.ConfigurationDoneResponse,
     _args: DebugProtocol.ConfigurationDoneArguments
   ): void {
-    this.configurationDone = true;
+    this.resolveConfigurationDone?.();
     this.sendResponse(response);
   }
 
@@ -67,7 +72,10 @@ export class InspethctDebugSession extends LoggingDebugSession {
       this.launchConfig = launchArgs;
       await this.waitForConfigurationDone();
 
-      this.runtime = new InspethctRuntime(this.processManager, launchArgs, this.processKey);
+      this.runtime = new InspethctRuntime(this.processManager, launchArgs, this.processKey, {
+        info: (msg) => this.sendEvent(new OutputEvent(`${msg}\n`, "console")),
+        warn: (msg) => this.sendEvent(new OutputEvent(`${msg}\n`, "stderr"))
+      });
       const state = await this.runtime.start();
 
       for (const [filePath, lines] of this.pendingBreakpoints.entries()) {
@@ -77,13 +85,26 @@ export class InspethctDebugSession extends LoggingDebugSession {
       this.sendResponse(response);
       this.sendEvent(new OutputEvent(`Connected to dbgserver\n`, "console"));
 
-      if (state.current) {
-        this.sendEvent(new StoppedEvent(state.current.reason || "entry", THREAD_ID));
-      } else if (!state.done) {
-        const paused = await this.runtime.next();
-        this.sendEvent(new StoppedEvent(paused.current?.reason || "entry", THREAD_ID));
-      } else {
+      const stopOnEntry = launchArgs.stopOnEntry === true;
+      this.sendEvent(new OutputEvent(`[dap] launch stopOnEntry=${String(stopOnEntry)}\n`, "console"));
+      let activeState = state;
+      this.sendEvent(new OutputEvent(`[dap] initial state: ${this.describeState(activeState)}\n`, "console"));
+      if (!activeState.current && !activeState.done) {
+        // Ensure we have an initial paused state before deciding whether to auto-continue.
+        activeState = await this.runtime.next();
+        this.sendEvent(new OutputEvent(`[dap] primed state via next: ${this.describeState(activeState)}\n`, "console"));
+      }
+
+      if (!stopOnEntry && !activeState.done) {
+        this.sendEvent(new OutputEvent(`[dap] auto-continue enabled, running to first breakpoint\n`, "console"));
+        activeState = await this.autoRunToBreakpoint(activeState);
+        this.sendEvent(new OutputEvent(`[dap] state after auto-run: ${this.describeState(activeState)}\n`, "console"));
+      }
+
+      if (activeState.done && !activeState.current) {
         this.sendEvent(new TerminatedEvent());
+      } else {
+        this.sendEvent(new StoppedEvent(activeState.current?.reason || (stopOnEntry ? "entry" : "breakpoint"), THREAD_ID));
       }
     } catch (error) {
       response.success = false;
@@ -113,7 +134,15 @@ export class InspethctDebugSession extends LoggingDebugSession {
     args: DebugProtocol.SetBreakpointsArguments
   ): Promise<void> {
     const filePath = args.source.path;
+    const sourceName = args.source.name;
     const clientLines = args.breakpoints?.map((b) => b.line).filter((n): n is number => typeof n === "number") ?? [];
+
+    this.sendEvent(
+      new OutputEvent(
+        `[dap] setBreakPointsRequest source=${sourceName || "<unknown>"} path=${filePath || "<missing>"} lines=${clientLines.join(",") || "<none>"}\n`,
+        "console"
+      )
+    );
 
     if (!filePath) {
       response.body = { breakpoints: [] };
@@ -121,15 +150,97 @@ export class InspethctDebugSession extends LoggingDebugSession {
       return;
     }
 
+    // The dbgserver source map only understands Solidity source names.
+    if (!this.isSolidityPath(filePath)) {
+      this.sendEvent(new OutputEvent(`[dap] skip non-solidity breakpoint file=${filePath}\n`, "console"));
+      response.body = {
+        breakpoints: clientLines.map(
+          (line): DebugProtocol.Breakpoint => ({
+            verified: false,
+            line,
+            message: "Only Solidity source breakpoints are supported."
+          })
+        )
+      };
+      this.sendResponse(response);
+      return;
+    }
+
     this.pendingBreakpoints.set(filePath, clientLines);
     if (this.runtime) {
-      await this.runtime.setSourceBreakpoints(filePath, clientLines);
+      try {
+        await this.runtime.setSourceBreakpoints(filePath, clientLines);
+      } catch (error) {
+        const message = String(error);
+        const knownMissingSource = /source\s+".+"\s+not found/i.test(message) && message.includes("gdb.setSourceBreakpoint");
+        this.sendEvent(new OutputEvent(`[dap] set breakpoint failed file=${filePath}: ${message}\n`, "stderr"));
+        response.body = {
+          breakpoints: clientLines.map(
+            (line): DebugProtocol.Breakpoint => ({
+              verified: false,
+              line,
+              message: knownMissingSource
+                ? "This file is not in the loaded contract source bundle."
+                : `Failed to set breakpoint: ${message}`
+            })
+          )
+        };
+        this.sendResponse(response);
+        return;
+      }
     }
+
+    this.sendEvent(new OutputEvent(`[dap] applied source breakpoints file=${filePath} count=${clientLines.length}\n`, "console"));
 
     response.body = {
       breakpoints: clientLines.map((line) => new Breakpoint(true, line))
     };
     this.sendResponse(response);
+  }
+
+  private isSolidityPath(filePath: string): boolean {
+    return path.extname(filePath).toLowerCase() === ".sol";
+  }
+
+  private async autoRunToBreakpoint(state: Awaited<ReturnType<InspethctRuntime["start"]>>): Promise<Awaited<ReturnType<InspethctRuntime["start"]>>> {
+    // Reasons that mean "we are not at a real stop yet, keep going". Anything
+    // else (e.g. "breakpoint", "exception", custom break reasons) is a genuine
+    // pause that the user should see.
+    const transientReasons = new Set(["entry", "step", "", "none"]);
+    let current = state;
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      if (current.done) {
+        return current;
+      }
+      const reason = current.current?.reason || "";
+      if (current.current && !transientReasons.has(reason)) {
+        return current;
+      }
+      this.sendEvent(new OutputEvent(`[dap] auto-run attempt=${attempt} continue from reason=${reason || "none"}\n`, "console"));
+      const next = await this.runtime!.continue();
+      if (this.samePausePoint(current, next) && !next.done) {
+        this.sendEvent(new OutputEvent(`[dap] continue made no progress, issuing one next() before retry\n`, "console"));
+        current = await this.runtime!.next();
+        continue;
+      }
+      current = next;
+    }
+    return current;
+  }
+
+  private samePausePoint(a: Awaited<ReturnType<InspethctRuntime["start"]>>, b: Awaited<ReturnType<InspethctRuntime["start"]>>): boolean {
+    const aPc = a.current?.step?.pc;
+    const bPc = b.current?.step?.pc;
+    const aReason = a.current?.reason || "";
+    const bReason = b.current?.reason || "";
+    return !a.done && !b.done && aPc === bPc && aReason === bReason;
+  }
+
+  private describeState(state: Awaited<ReturnType<InspethctRuntime["start"]>>): string {
+    if (state.done && !state.current) {
+      return "done=true current=none";
+    }
+    return `done=${String(state.done)} reason=${state.current?.reason || "none"} pc=${String(state.current?.step?.pc ?? "n/a")}`;
   }
 
   protected async nextRequest(response: DebugProtocol.NextResponse, _args: DebugProtocol.NextArguments): Promise<void> {
@@ -231,10 +342,10 @@ export class InspethctDebugSession extends LoggingDebugSession {
   }
 
   private async waitForConfigurationDone(): Promise<void> {
-    const startedAt = Date.now();
-    while (!this.configurationDone && Date.now() - startedAt < 5000) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+    await Promise.race([
+      this.configurationDonePromise,
+      new Promise<void>((resolve) => setTimeout(resolve, 5000))
+    ]);
   }
 }
 

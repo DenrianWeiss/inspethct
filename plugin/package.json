@@ -16,7 +16,10 @@
     "onDebug",
     "onDebugResolve:inspethct",
     "onLanguage:solidity",
+    "onCommand:inspethct.start",
     "onCommand:inspethct.debugFunction",
+    "onCommand:inspethct.debugAtCursor",
+    "onCommand:inspethct.debugContract",
     "onCommand:inspethct.importReplayFromChain",
     "onCommand:inspethct.runSequenceScript",
     "onCommand:inspethct.openSequenceBuilder"
@@ -55,6 +58,10 @@
               "listenHost": {
                 "type": "string",
                 "default": "127.0.0.1"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": false
               },
               "listenPort": {
                 "type": "number",
@@ -95,12 +102,24 @@
               "call": {
                 "type": "object",
                 "properties": {
-                  "from": { "type": "string" },
-                  "to": { "type": "string" },
-                  "input": { "type": "string" },
-                  "value": { "type": "string" },
-                  "gas": { "type": "string" },
-                  "block": { "type": "string" }
+                  "from": {
+                    "type": "string"
+                  },
+                  "to": {
+                    "type": "string"
+                  },
+                  "input": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  },
+                  "gas": {
+                    "type": "string"
+                  },
+                  "block": {
+                    "type": "string"
+                  }
                 }
               },
               "sequence": {
@@ -116,7 +135,13 @@
               },
               "promptSourceBundle": {
                 "type": "boolean",
-                "default": true
+                "default": false,
+                "description": "Deprecated. Source bundle is auto-detected when autoSourceBundle is true."
+              },
+              "autoSourceBundle": {
+                "type": "boolean",
+                "default": true,
+                "description": "Auto-detect source bundle from local artifacts or block explorer."
               },
               "carryUserMutations": {
                 "type": "boolean",
@@ -137,7 +162,7 @@
               "upstream": "http://127.0.0.1:8545",
               "txHash": "0x",
               "autoStartDbgserver": true,
-              "promptSourceBundle": true
+              "autoSourceBundle": true
             }
           },
           {
@@ -158,7 +183,7 @@
                 "block": "latest"
               },
               "autoStartDbgserver": true,
-              "promptSourceBundle": true
+              "autoSourceBundle": true
             }
           }
         ]
@@ -166,8 +191,22 @@
     ],
     "commands": [
       {
+        "command": "inspethct.start",
+        "title": "Inspethct: Start Debugging",
+        "icon": "$(debug-start)"
+      },
+      {
         "command": "inspethct.debugFunction",
         "title": "Inspethct: Debug Function"
+      },
+      {
+        "command": "inspethct.debugAtCursor",
+        "title": "Inspethct: Debug at Cursor"
+      },
+      {
+        "command": "inspethct.debugContract",
+        "title": "Inspethct: Debug This Contract",
+        "icon": "$(debug-alt)"
       },
       {
         "command": "inspethct.importReplayFromChain",
@@ -182,6 +221,22 @@
         "title": "Inspethct: Open Sequence Builder"
       }
     ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "inspethct.debugAtCursor",
+          "when": "resourceLangId == solidity",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "inspethct.debugContract",
+          "when": "resourceLangId == solidity",
+          "group": "navigation"
+        }
+      ]
+    },
     "configuration": {
       "title": "Inspethct",
       "properties": {
@@ -205,18 +260,36 @@
         "inspethct.defaultForkMode": {
           "type": "string",
           "default": "diff"
+        },
+        "inspethct.explorerApiBase": {
+          "type": "string",
+          "default": "https://api.etherscan.io/v2/api",
+          "description": "Block explorer API base URL used as fallback for source detection."
+        },
+        "inspethct.explorerApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the explorer (required to fetch verified sources)."
+        },
+        "inspethct.explorerChainId": {
+          "type": "string",
+          "default": "1",
+          "description": "Chain ID passed to the explorer (1 = Ethereum mainnet)."
         }
       }
     }
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "build": "node esbuild.js --production",
+    "typecheck": "tsc -p ./ --noEmit",
+    "vscode:prepublish": "npm run typecheck && npm run build",
     "package": "vsce package",
     "publish": "vsce publish"
   },
   "dependencies": {
-    "@vscode/debugadapter": "^1.67.0",
+    "@vscode/debugadapter": "^1.68.0",
     "@vscode/debugprotocol": "^1.67.0",
     "ethers": "^6.15.0"
   },
@@ -224,6 +297,7 @@
     "@types/node": "^22.15.3",
     "@types/vscode": "^1.91.0",
     "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
     "typescript": "^5.8.3"
   }
 }

@@ -14,6 +14,7 @@ import (
 	"inspethct/internal/contractmeta"
 	"inspethct/internal/engine"
 	"inspethct/internal/forkengine"
+	"inspethct/internal/forkengine/upstream"
 	"inspethct/internal/srcmap"
 )
 
@@ -123,6 +124,7 @@ type sourceBundleRequest struct {
 	APIBase          string `json:"apiBase"`
 	APIKey           string `json:"apiKey"`
 	RPCURL           string `json:"rpcUrl"`
+	ChainID          string `json:"chainId"`
 }
 
 type sourceBreakpointRequest struct {
@@ -613,7 +615,7 @@ func (server *Server) loadSourceBundle(ctx context.Context, params []json.RawMes
 		runtime = *config.Runtime
 	}
 	loadOptions := contractmeta.LoadOptions{SourceName: config.SourceName, ContractName: config.ContractName, Runtime: runtime}
-	if loadOptions.ContractName == "" {
+	if config.Kind != "auto" && loadOptions.ContractName == "" {
 		return nil, &respError{Code: -32602, Message: "contractName is required"}
 	}
 	if addr, ok := parseAddress(config.Address); ok {
@@ -622,8 +624,12 @@ func (server *Server) loadSourceBundle(ctx context.Context, params []json.RawMes
 	if addr, ok := parseAddress(config.CodeAddress); ok {
 		loadOptions.CodeAddress = &addr
 	}
-	var bundle *contractmeta.Bundle
-	var err error
+	var (
+		bundle      *contractmeta.Bundle
+		diagnostics []string
+		sourceLabel string
+		err         error
+	)
 	switch config.Kind {
 	case "local-project":
 		bundle, err = contractmeta.LoadLocalProjectBundle(config.ProjectRoot, loadOptions)
@@ -643,7 +649,15 @@ func (server *Server) loadSourceBundle(ctx context.Context, params []json.RawMes
 		if address == nil {
 			return nil, &respError{Code: -32602, Message: "explorer source bundle requires address or an active contract session"}
 		}
-		bundle, err = contractmeta.LoadExplorerBundle(ctx, contractmeta.ExplorerClient{APIBase: config.APIBase, APIKey: config.APIKey, RPCURL: config.RPCURL}, manager, contractmeta.ExplorerLoadOptions{Address: *address, LoadOptions: loadOptions, RPCURL: config.RPCURL})
+		bundle, err = contractmeta.LoadExplorerBundle(ctx, contractmeta.ExplorerClient{APIBase: config.APIBase, APIKey: config.APIKey, RPCURL: config.RPCURL, ChainID: config.ChainID}, manager, contractmeta.ExplorerLoadOptions{Address: *address, LoadOptions: loadOptions, RPCURL: config.RPCURL})
+	case "auto":
+		result, autoErr := server.autoLoadBundle(ctx, session, config, loadOptions)
+		if autoErr != nil {
+			return nil, autoErr
+		}
+		bundle = result.Bundle
+		diagnostics = result.Diagnostics
+		sourceLabel = result.Source
 	default:
 		return nil, &respError{Code: -32602, Message: "unsupported source bundle kind"}
 	}
@@ -670,7 +684,69 @@ func (server *Server) loadSourceBundle(ctx context.Context, params []json.RawMes
 	if bundle.Address != nil {
 		session.TargetAddr = bundle.Address
 	}
-	return server.describeSession(session), nil
+	described := server.describeSession(session)
+	if sourceLabel != "" {
+		described["bundleSource"] = sourceLabel
+	}
+	if len(diagnostics) > 0 {
+		described["bundleDiagnostics"] = diagnostics
+	}
+	return described, nil
+}
+
+// engineAutoSourceProvider adapts the forkengine to contractmeta.AutoSourceProvider so the auto
+// loader can fetch deployed bytecode and read EIP-1967 storage slots without importing forkengine.
+type engineAutoSourceProvider struct {
+	server  *Server
+	session *ReplaySession
+}
+
+func (p engineAutoSourceProvider) GetCodeAt(ctx context.Context, addr engine.Address) ([]byte, error) {
+	return p.server.engine.GetCodeAt(ctx, addr, p.blockRef())
+}
+
+func (p engineAutoSourceProvider) GetStorageSlot(ctx context.Context, addr engine.Address, slot engine.Hash) (engine.Hash, error) {
+	return p.server.engine.GetStorageSlot(ctx, addr, slot, p.blockRef())
+}
+
+func (p engineAutoSourceProvider) blockRef() upstream.BlockRef {
+	if p.session != nil && p.session.CallRequest != nil {
+		return p.session.CallRequest.Block
+	}
+	return upstream.BlockRef{}
+}
+
+func (server *Server) autoLoadBundle(ctx context.Context, session *ReplaySession, config sourceBundleRequest, loadOpts contractmeta.LoadOptions) (*contractmeta.AutoLoadResult, *respError) {
+	address := loadOpts.Address
+	if address == nil {
+		address = session.TargetAddr
+	}
+	if address == nil {
+		return nil, &respError{Code: -32602, Message: "auto source bundle requires an address or an active contract session"}
+	}
+	provider := engineAutoSourceProvider{server: server, session: session}
+	autoOpts := contractmeta.AutoLoadOptions{
+		Address:               *address,
+		CodeAddress:           loadOpts.CodeAddress,
+		ProjectRoot:           config.ProjectRoot,
+		PreferredContractName: loadOpts.ContractName,
+	}
+	if config.APIBase != "" {
+		autoOpts.Explorer = contractmeta.ExplorerClient{APIBase: config.APIBase, APIKey: config.APIKey, RPCURL: config.RPCURL, ChainID: config.ChainID}
+		manager, managerErr := contractmeta.NewSolcManager()
+		if managerErr == nil {
+			autoOpts.SolcManager = manager
+		}
+	}
+	result, err := contractmeta.AutoLoadBundle(ctx, provider, autoOpts)
+	if err != nil {
+		var autoErr *contractmeta.AutoLoadError
+		if errors.As(err, &autoErr) {
+			return nil, &respError{Code: -32004, Message: autoErr.Error(), Data: map[string]any{"diagnostics": autoErr.Diagnostics}}
+		}
+		return nil, internalError(err)
+	}
+	return result, nil
 }
 
 func (server *Server) setSourceBreakpoint(params []json.RawMessage) (any, *respError) {
@@ -999,33 +1075,113 @@ func resolveSourceBreakpointPCs(bundle *contractmeta.Bundle, sourceName string, 
 	if column <= 0 {
 		column = 1
 	}
-	offset, ok := file.OffsetForLineColumn(line, column)
+	// Compute the byte range of the requested line, [lineStart, lineEnd).
+	lineStart, ok := file.OffsetForLineColumn(line, 1)
 	if !ok {
-		return nil, &respError{Code: -32602, Message: fmt.Sprintf("invalid line/column %d:%d", line, column)}
+		return nil, &respError{Code: -32602, Message: fmt.Sprintf("invalid line %d", line)}
 	}
-	instructions := bundle.Index.InstructionsForSource(file.ID, offset, offset+1)
-	if len(instructions) == 0 {
-		for _, instruction := range bundle.Index.Instructions {
+	lineEnd, ok := file.OffsetForLineColumn(line+1, 1)
+	if !ok {
+		lineEnd = len(file.Content)
+	}
+	if lineEnd <= lineStart {
+		lineEnd = lineStart + 1
+	}
+
+	// Strict match: instruction's source range must begin on this line and
+	// fit within the remaining tail of the line. This filters out the wide
+	// dispatcher / contract-definition mappings (e.g. `s=0,l=<file size>,f=id`)
+	// that otherwise overlap every line and would resolve every breakpoint to
+	// PC=0. Compiler-generated instructions (SourceID == -1) are skipped per
+	// the source_mapping.rst convention.
+	type candidate struct {
+		pc     uint64
+		start  int
+		length int
+	}
+	var matches []candidate
+	for _, instruction := range bundle.Index.Instructions {
+		src := instruction.Source
+		if src.SourceID != file.ID {
+			continue
+		}
+		if src.Start < lineStart || src.Start >= lineEnd {
+			continue
+		}
+		// Reject instructions whose source span extends beyond the current
+		// line; those are typically function- or contract-level mappings.
+		if src.End() > lineEnd {
+			continue
+		}
+		matches = append(matches, candidate{pc: instruction.PC, start: src.Start, length: src.Length})
+	}
+
+	// Prefer instructions starting at or after the requested column; fall back
+	// to the earliest match on the line otherwise.
+	requestedOffset := lineStart + column - 1
+	if requestedOffset < lineStart {
+		requestedOffset = lineStart
+	}
+
+	if len(matches) == 0 {
+		// Fallback: the requested line may not have any compiled statements
+		// (blank line, comment, etc). Walk forward to the next line that does
+		// have a mapping so users still get a usable breakpoint.
+		var fallback *srcmap.InstructionMapping
+		for index := range bundle.Index.Instructions {
+			instruction := &bundle.Index.Instructions[index]
 			if instruction.Source.SourceID != file.ID {
 				continue
 			}
-			if instruction.Source.Start >= offset {
-				instructions = append(instructions, instruction)
-				break
+			if instruction.Source.Start < lineStart {
+				continue
+			}
+			if fallback == nil || instruction.Source.Start < fallback.Source.Start {
+				fallback = instruction
+			}
+		}
+		if fallback == nil {
+			return nil, &respError{Code: -32602, Message: "no instruction mapping found for requested source location"}
+		}
+		return []uint64{fallback.PC}, nil
+	}
+
+	// Pick the smallest source span that starts at or after requestedOffset;
+	// if none, use the smallest span on the line. This corresponds to the
+	// innermost statement at the user's chosen position.
+	best := -1
+	for i, c := range matches {
+		if c.start < requestedOffset {
+			continue
+		}
+		if best == -1 || matches[i].length < matches[best].length || (matches[i].length == matches[best].length && matches[i].start < matches[best].start) {
+			best = i
+		}
+	}
+	if best == -1 {
+		for i := range matches {
+			if best == -1 || matches[i].length < matches[best].length || (matches[i].length == matches[best].length && matches[i].start < matches[best].start) {
+				best = i
 			}
 		}
 	}
-	if len(instructions) == 0 {
-		return nil, &respError{Code: -32602, Message: "no instruction mapping found for requested source location"}
-	}
-	pcs := make([]uint64, 0, len(instructions))
+
+	chosenStart := matches[best].start
+	chosenLength := matches[best].length
+
+	// Return every PC that shares the chosen source span — the same statement
+	// is often emitted multiple times (e.g. inlined per overload/branch).
+	pcs := make([]uint64, 0, 4)
 	seen := make(map[uint64]struct{})
-	for _, instruction := range instructions {
-		if _, ok := seen[instruction.PC]; ok {
+	for _, c := range matches {
+		if c.start != chosenStart || c.length != chosenLength {
 			continue
 		}
-		seen[instruction.PC] = struct{}{}
-		pcs = append(pcs, instruction.PC)
+		if _, dup := seen[c.pc]; dup {
+			continue
+		}
+		seen[c.pc] = struct{}{}
+		pcs = append(pcs, c.pc)
 	}
 	sort.Slice(pcs, func(i, j int) bool { return pcs[i] < pcs[j] })
 	return pcs, nil

@@ -743,16 +743,14 @@ export class SequenceBuilderPanel {
 
     function refreshStatus() {
       const errors = validateScript(state);
+      startBtn.disabled = false;
+      startBtn.style.opacity = '1';
       if (errors.length === 0) {
         statusEl.className = 'status';
         statusEl.textContent = 'Ready to start. ' + state.sequence.length + ' step(s) configured.';
-        startBtn.disabled = false;
-        startBtn.style.opacity = '1';
       } else {
         statusEl.className = 'status error';
         statusEl.textContent = errors[0] + (errors.length > 1 ? ' (+' + (errors.length - 1) + ' more)' : '');
-        startBtn.disabled = true;
-        startBtn.style.opacity = '0.6';
       }
     }
 

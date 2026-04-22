@@ -5,12 +5,52 @@ import (
 	"fmt"
 	"math/big"
 
+	"inspethct/internal/engine"
 	"inspethct/internal/forkengine/ext"
 	"inspethct/internal/forkengine/upstream"
 )
 
 func (engineRef *Engine) ChainID(ctx context.Context) (*big.Int, error) {
 	return engineRef.provider.ChainID(ctx)
+}
+
+// GetCodeAt returns the deployed bytecode at the given address as of the supplied block ref.
+// The block ref may be nil to fall back to the engine's pinned block.
+func (engineRef *Engine) GetCodeAt(ctx context.Context, addr engine.Address, block upstream.BlockRef) ([]byte, error) {
+	resolvedRef := block
+	if resolvedRef.Number == nil && resolvedRef.Tag == "" {
+		resolvedRef = engineRef.block
+	}
+	if code, ok := engineRef.cache.GetCode(addr, resolvedRef); ok && code != nil {
+		return append([]byte(nil), code...), nil
+	}
+	code, err := engineRef.provider.GetCode(ctx, addr, resolvedRef)
+	if err != nil {
+		return nil, err
+	}
+	if code == nil {
+		code = []byte{}
+	}
+	engineRef.cache.PutCode(addr, resolvedRef, code)
+	return append([]byte(nil), code...), nil
+}
+
+// GetStorageSlot returns the storage value at the supplied slot for an address at the given block.
+// The block ref may be nil to fall back to the engine's pinned block.
+func (engineRef *Engine) GetStorageSlot(ctx context.Context, addr engine.Address, slot engine.Hash, block upstream.BlockRef) (engine.Hash, error) {
+	resolvedRef := block
+	if resolvedRef.Number == nil && resolvedRef.Tag == "" {
+		resolvedRef = engineRef.block
+	}
+	if value, ok := engineRef.cache.GetStorage(addr, slot, resolvedRef); ok {
+		return value, nil
+	}
+	value, err := engineRef.provider.GetStorageAt(ctx, addr, slot, resolvedRef)
+	if err != nil {
+		return engine.Hash{}, err
+	}
+	engineRef.cache.PutStorage(addr, slot, resolvedRef, value)
+	return value, nil
 }
 
 func (engineRef *Engine) EthCall(ctx context.Context, req ext.EthCallRequest) ([]byte, error) {

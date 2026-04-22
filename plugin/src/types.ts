@@ -1,7 +1,7 @@
 export type SessionType = "replay" | "call" | "sequence";
 
 export interface SourceBundleConfig {
-  kind: "local-project" | "standard-json" | "manual" | "explorer";
+  kind: "auto" | "local-project" | "standard-json" | "manual" | "explorer";
   contractName: string;
   sourceName?: string;
   runtime?: boolean;
@@ -13,6 +13,7 @@ export interface SourceBundleConfig {
   apiBase?: string;
   apiKey?: string;
   rpcUrl?: string;
+  chainId?: string;
 }
 
 export interface LaunchCallConfig {
@@ -48,6 +49,7 @@ export interface InspethctLaunchConfig {
   dbgserverUrl?: string;
   listenHost?: string;
   listenPort?: number;
+  stopOnEntry?: boolean;
   block?: string;
   fork?: string;
   forkMode?: string;
@@ -59,6 +61,7 @@ export interface InspethctLaunchConfig {
   sequence?: SequenceStep[];
   sourceBundle?: SourceBundleConfig;
   promptSourceBundle?: boolean;
+  autoSourceBundle?: boolean;
   carryUserMutations?: boolean;
 }
 

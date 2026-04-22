@@ -397,10 +397,34 @@ func (server *Server) advanceLoadedSession(ctx context.Context, session *ReplayS
 		session.Done = true
 		return server.describeSession(session), nil
 	}
-	if rpcErr := server.replaySession(ctx, session, all); rpcErr != nil {
-		return nil, rpcErr
+	if !all {
+		if rpcErr := server.replaySession(ctx, session, false); rpcErr != nil {
+			return nil, rpcErr
+		}
+		return server.describeSession(session), nil
 	}
-	return server.describeSession(session), nil
+
+	// In continue mode we should only stop on explicit break conditions. If any
+	// code path accidentally yields a plain "step" pause, keep advancing.
+	const maxContinueAttempts = 2048
+	lastStep := -1
+	for attempt := 0; attempt < maxContinueAttempts; attempt++ {
+		if rpcErr := server.replaySession(ctx, session, true); rpcErr != nil {
+			return nil, rpcErr
+		}
+		if session.Done || session.Current == nil {
+			return server.describeSession(session), nil
+		}
+		if session.Current.Reason != "step" {
+			return server.describeSession(session), nil
+		}
+		// Defensive guard against pathological non-progress loops.
+		if session.Current.StepIndex <= lastStep {
+			return nil, &respError{Code: -32001, Message: "continue made no progress while handling step pauses"}
+		}
+		lastStep = session.Current.StepIndex
+	}
+	return nil, &respError{Code: -32001, Message: "continue exceeded max step retries"}
 }
 
 func (server *Server) sessionState(sessionID string) (any, *respError) {

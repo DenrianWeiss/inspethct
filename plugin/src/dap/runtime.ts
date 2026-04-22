@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import { RpcClient } from "../services/rpcClient";
 import { DbgserverProcessManager } from "../services/processManager";
-import { InspethctLaunchConfig, SequenceStep } from "../types";
+import { InspethctLaunchConfig, SequenceStep, SourceBundleConfig } from "../types";
 
 interface DbgserverCapabilities {
   mode?: string;
@@ -13,6 +13,11 @@ interface DbgserverCapabilities {
   };
 }
 
+export interface RuntimeNotifier {
+  info(message: string): void;
+  warn(message: string): void;
+}
+
 export interface GdbSessionState {
   kind: "replay" | "call";
   id: string;
@@ -22,6 +27,7 @@ export interface GdbSessionState {
     reason: string;
     breakpoint?: string;
     stepIndex: number;
+    codeAddress?: string;
     source?: {
       sourceName?: string;
       line?: number;
@@ -52,6 +58,9 @@ export interface GdbSessionState {
   };
   breakpoints?: Array<{ id: string }>;
   mutations?: Array<{ kind: string; [key: string]: unknown }>;
+  bundles?: Array<{ codeAddress: string; sourceName?: string; contractName?: string }>;
+  bundleSource?: string;
+  bundleDiagnostics?: string[];
 }
 
 interface RuntimeSequenceState {
@@ -82,11 +91,13 @@ export class InspethctRuntime {
   private readonly sourcePathToName = new Map<string, string>();
   private readonly sourcePathToBreakpointIds = new Map<string, string[]>();
   private capabilities?: DbgserverCapabilities;
+  private readonly autoLoadedAddresses = new Set<string>();
 
   constructor(
     private readonly processManager: DbgserverProcessManager,
     private readonly launch: InspethctLaunchConfig,
-    processKey: string
+    processKey: string,
+    private readonly notifier?: RuntimeNotifier
   ) {
     this.managedProcessKey = processKey;
   }
@@ -123,8 +134,10 @@ export class InspethctRuntime {
     }
 
     if (this.launch.sourceBundle) {
-      this.lastState = await this.rpc.call<GdbSessionState>("gdb.loadSourceBundle", [this.sessionId, this.launch.sourceBundle]);
+      await this.loadSourceBundle(this.launch.sourceBundle, "initial");
     }
+
+    await this.maybeAutoLoadForCurrent();
 
     return this.lastState;
   }
@@ -139,6 +152,7 @@ export class InspethctRuntime {
     this.ensureRpc();
     this.lastState = await this.rpc!.call<GdbSessionState>("gdb.next", [this.sessionId]);
     await this.handleSequenceProgress();
+    await this.maybeAutoLoadForCurrent();
     return this.lastState!;
   }
 
@@ -146,6 +160,7 @@ export class InspethctRuntime {
     this.ensureRpc();
     this.lastState = await this.rpc!.call<GdbSessionState>("gdb.continue", [this.sessionId]);
     await this.handleSequenceProgress();
+    await this.maybeAutoLoadForCurrent();
     return this.lastState!;
   }
 
@@ -153,10 +168,12 @@ export class InspethctRuntime {
     this.ensureRpc();
     const sourceName = this.resolveSourceName(filePath);
     this.sourcePathToName.set(filePath, sourceName);
+    this.notifier?.info(`[runtime] setSourceBreakpoints path=${filePath} sourceName=${sourceName} lines=${lines.join(",") || "<none>"}`);
 
     const existing = this.sourcePathToBreakpointIds.get(filePath) ?? [];
     for (const id of existing) {
       await this.rpc!.call("gdb.deleteBreakpoint", [this.sessionId, { id }]);
+      this.notifier?.info(`[runtime] deleted breakpoint id=${id}`);
     }
 
     const created: string[] = [];
@@ -172,6 +189,7 @@ export class InspethctRuntime {
         }
       ]);
       created.push(id);
+      this.notifier?.info(`[runtime] created source breakpoint id=${id}`);
     }
     this.sourcePathToBreakpointIds.set(filePath, created);
   }
@@ -337,17 +355,14 @@ export class InspethctRuntime {
       this.sessionId = advanced.activeSessionId;
       this.sequence.index = advanced.currentStepIndex;
       this.lastState = advanced.activeSession;
+      this.autoLoadedAddresses.clear();
 
       if (this.launch.sourceBundle) {
-        this.lastState = await this.rpc!.call<GdbSessionState>("gdb.loadSourceBundle", [this.sessionId, this.launch.sourceBundle]);
+        await this.loadSourceBundle(this.launch.sourceBundle, "sequence step");
       }
 
-      for (const [filePath, _] of this.sourcePathToBreakpointIds.entries()) {
-        const lineIds = this.sourcePathToBreakpointIds.get(filePath) ?? [];
-        const lines = lineIds
-          .map((id) => Number.parseInt(id.slice(id.lastIndexOf("-") + 1), 10))
-          .filter((line) => Number.isFinite(line));
-        await this.setSourceBreakpoints(filePath, lines);
+      for (const filePath of this.sourcePathToBreakpointIds.keys()) {
+        await this.reapplyBreakpointsForFile(filePath);
       }
       return;
     }
@@ -363,17 +378,14 @@ export class InspethctRuntime {
 
     this.sequence.index = nextIndex;
     this.lastState = await this.startCallSession(this.sequence.steps[nextIndex]);
+    this.autoLoadedAddresses.clear();
 
     if (this.launch.sourceBundle) {
-      this.lastState = await this.rpc!.call<GdbSessionState>("gdb.loadSourceBundle", [this.sessionId, this.launch.sourceBundle]);
+      await this.loadSourceBundle(this.launch.sourceBundle, "sequence step");
     }
 
-    for (const [filePath, _] of this.sourcePathToBreakpointIds.entries()) {
-      const lineIds = this.sourcePathToBreakpointIds.get(filePath) ?? [];
-      const lines = lineIds
-        .map((id) => Number.parseInt(id.slice(id.lastIndexOf("-") + 1), 10))
-        .filter((line) => Number.isFinite(line));
-      await this.setSourceBreakpoints(filePath, lines);
+    for (const filePath of this.sourcePathToBreakpointIds.keys()) {
+      await this.reapplyBreakpointsForFile(filePath);
     }
   }
 
@@ -381,5 +393,74 @@ export class InspethctRuntime {
     if (!this.rpc) {
       throw new Error("runtime is not started");
     }
+  }
+
+  private async loadSourceBundle(bundle: SourceBundleConfig, reason: string): Promise<void> {
+    this.ensureRpc();
+    try {
+      const updated = await this.rpc!.call<GdbSessionState>("gdb.loadSourceBundle", [this.sessionId, bundle]);
+      this.lastState = updated;
+      const tag = updated.bundleSource ? `via ${updated.bundleSource}` : reason;
+      this.notifier?.info(`Source bundle loaded ${tag}`);
+      if (updated.bundleDiagnostics?.length) {
+        for (const line of updated.bundleDiagnostics) {
+          this.notifier?.info(`  ${line}`);
+        }
+      }
+      // Re-apply any pre-existing source breakpoints because PCs may now resolve.
+      for (const filePath of this.sourcePathToBreakpointIds.keys()) {
+        await this.reapplyBreakpointsForFile(filePath);
+      }
+    } catch (error) {
+      const message = String(error);
+      if (bundle.kind === "auto") {
+        this.notifier?.warn(`Auto source detection failed: ${message}`);
+      } else {
+        this.notifier?.warn(`Source bundle load failed: ${message}`);
+      }
+    }
+  }
+
+  private async maybeAutoLoadForCurrent(): Promise<void> {
+    if (this.launch.autoSourceBundle === false) {
+      return;
+    }
+    const codeAddress = this.lastState?.current?.codeAddress?.toLowerCase();
+    if (!codeAddress || codeAddress === "0x" || codeAddress === "") {
+      return;
+    }
+    if (this.autoLoadedAddresses.has(codeAddress)) {
+      return;
+    }
+    if (this.lastState?.bundles?.some((b) => b.codeAddress?.toLowerCase() === codeAddress)) {
+      this.autoLoadedAddresses.add(codeAddress);
+      return;
+    }
+    this.autoLoadedAddresses.add(codeAddress);
+    const baseBundle = this.launch.sourceBundle;
+    const folderRoot = (this.launch as InspethctLaunchConfig & { workspaceRoot?: string }).workspaceRoot;
+    const autoBundle: SourceBundleConfig = {
+      kind: "auto",
+      contractName: "",
+      runtime: true,
+      projectRoot: baseBundle?.projectRoot || folderRoot,
+      apiBase: baseBundle?.apiBase,
+      apiKey: baseBundle?.apiKey,
+      chainId: baseBundle?.chainId,
+      address: codeAddress,
+      codeAddress
+    };
+    await this.loadSourceBundle(autoBundle, `auto for ${codeAddress}`);
+  }
+
+  private async reapplyBreakpointsForFile(filePath: string): Promise<void> {
+    const ids = this.sourcePathToBreakpointIds.get(filePath) ?? [];
+    if (ids.length === 0) {
+      return;
+    }
+    const lines = ids
+      .map((id) => Number.parseInt(id.slice(id.lastIndexOf("-") + 1), 10))
+      .filter((line) => Number.isFinite(line));
+    await this.setSourceBreakpoints(filePath, lines);
   }
 }
