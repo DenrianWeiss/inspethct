@@ -28,3 +28,4 @@
 !docs/*.md
 !.github/workflows/*.yml
 !internal/engine/trusted_setup.json
+!Makefile
