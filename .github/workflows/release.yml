@@ -34,6 +34,26 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Ensure submodule fixtures are available
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+          EVM_TESTS_DIR="internal/engine/evm-tests"
+          if [[ ! -d "$EVM_TESTS_DIR" ]]; then
+            echo "missing submodule path: $EVM_TESTS_DIR"
+            exit 1
+          fi
+
+          pushd "$EVM_TESTS_DIR" >/dev/null
+          if [[ -f fixtures_general_state_tests.tgz && ! -d GeneralStateTests/VMTests ]]; then
+            tar -xzf fixtures_general_state_tests.tgz
+          fi
+          if [[ -f fixtures_blockchain_tests.tgz && ! -d BlockchainTests/GeneralStateTests ]]; then
+            tar -xzf fixtures_blockchain_tests.tgz
+          fi
+          popd >/dev/null
+
       - name: Run full test suite
         run: go test -count=1 ./...
 
