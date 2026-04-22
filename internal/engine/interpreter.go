@@ -15,6 +15,7 @@ type EVM struct {
 	memory      Memory
 	pc          uint64
 	returnData  []byte
+	outputData  []byte
 	jumpdests   map[uint64]bool
 	hooks       HookRegistry
 }
@@ -96,7 +97,7 @@ func (evm *EVM) Run(code []byte) (res *ExecutionResult, err error) {
 			builder := NewExecutionResultBuilder()
 			builder.SetStatus(status)
 			builder.SetError(fmt.Errorf("%v", r))
-			builder.SetReturnData(evm.returnData)
+			builder.SetReturnData(evm.outputData)
 			res = builder.Build()
 			err = fmt.Errorf("%v", r)
 		}
@@ -112,7 +113,7 @@ func (evm *EVM) Run(code []byte) (res *ExecutionResult, err error) {
 			builder.SetStatus(StatusSuccess)
 			builder.SetGasRemaining(evm.gasMeter.Gas())
 			builder.SetGasRefund(evm.gasMeter.Refund())
-			builder.SetReturnData(evm.returnData)
+			builder.SetReturnData(evm.outputData)
 			builder.SetLogs(evm.state.Logs())
 			return builder.Build(), nil
 		}
@@ -159,7 +160,7 @@ func (evm *EVM) Run(code []byte) (res *ExecutionResult, err error) {
 			status := classifyError(err)
 			builder.SetStatus(status)
 			builder.SetError(err)
-			builder.SetReturnData(evm.returnData)
+			builder.SetReturnData(evm.outputData)
 			if status == StatusRevert {
 				builder.SetGasRemaining(evm.gasMeter.Gas())
 			}
@@ -173,7 +174,7 @@ func (evm *EVM) Run(code []byte) (res *ExecutionResult, err error) {
 			status := classifyError(err)
 			builder.SetStatus(status)
 			builder.SetError(err)
-			builder.SetReturnData(evm.returnData)
+			builder.SetReturnData(evm.outputData)
 			if status == StatusRevert {
 				builder.SetGasRemaining(evm.gasMeter.Gas())
 				builder.SetGasRefund(evm.gasMeter.Refund())

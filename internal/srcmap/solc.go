@@ -9,20 +9,21 @@ import (
 )
 
 type standardJSON struct {
-	Sources   map[string]standardJSONSource                 `json:"sources"`
-	Contracts map[string]map[string]standardJSONContract    `json:"contracts"`
+	Sources   map[string]standardJSONSource              `json:"sources"`
+	Contracts map[string]map[string]standardJSONContract `json:"contracts"`
 }
 
 type standardJSONSource struct {
-	ID      int             `json:"id"`
-	AST     map[string]any  `json:"ast"`
-	Content string          `json:"content"`
+	ID      int            `json:"id"`
+	AST     map[string]any `json:"ast"`
+	Content string         `json:"content"`
 }
 
 type standardJSONContract struct {
-	StorageLayout          StorageLayout     `json:"storageLayout"`
-	TransientStorageLayout StorageLayout     `json:"transientStorageLayout"`
-	EVM                    standardJSONEVM   `json:"evm"`
+	ABI                    []ABIEntry      `json:"abi"`
+	StorageLayout          StorageLayout   `json:"storageLayout"`
+	TransientStorageLayout StorageLayout   `json:"transientStorageLayout"`
+	EVM                    standardJSONEVM `json:"evm"`
 }
 
 type standardJSONEVM struct {
@@ -31,9 +32,9 @@ type standardJSONEVM struct {
 }
 
 type standardJSONBytecode struct {
-	Object           string               `json:"object"`
-	SourceMap        string               `json:"sourceMap"`
-	GeneratedSources []generatedSource    `json:"generatedSources"`
+	Object           string            `json:"object"`
+	SourceMap        string            `json:"sourceMap"`
+	GeneratedSources []generatedSource `json:"generatedSources"`
 }
 
 type generatedSource struct {
@@ -69,6 +70,7 @@ func BuildIndexFromStandardJSON(data []byte, cfg BuildConfig) (*Index, error) {
 		GeneratedSourceIDs: make(map[int]struct{}),
 		PersistentLayout:   artifact.StorageLayout,
 		TransientLayout:    artifact.TransientStorageLayout,
+		ABI:                append([]ABIEntry(nil), artifact.ABI...),
 	}
 
 	for name, src := range doc.Sources {
@@ -111,6 +113,7 @@ func BuildIndexFromStandardJSON(data []byte, cfg BuildConfig) (*Index, error) {
 	idx.Instructions = instructions
 	idx.StorageVariables = idx.buildStorageVariables(artifact.StorageLayout, StorageScopePersistent)
 	idx.TransientVariables = idx.buildStorageVariables(artifact.TransientStorageLayout, StorageScopeTransient)
+	idx.Functions, idx.Events = deriveABIMetadata(idx.ABI)
 
 	for sourceID, nodes := range idx.NodesBySourceID {
 		sort.Slice(nodes, func(i, j int) bool {

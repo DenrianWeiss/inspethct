@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/big"
+
+	gethcommon "github.com/ethereum/go-ethereum/common"
+	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 )
 
 // CallKind identifies the type of message call.
@@ -67,14 +70,20 @@ func (evm *EVM) ExecuteMessage(msg *Message) (*ExecutionResult, error) {
 	accSnap := account.Snapshot()
 	stoSnap := evm.state.Storage().Snapshot()
 
+	// For contract creation, initialize the target account nonce per EIP-161
+	// even when value transfer creates/touches the account first.
+	if msg.IsCreate {
+		if !account.Exists(msg.Callee) {
+			account.CreateAccount(msg.Callee)
+		}
+		if account.Nonce(msg.Callee) == 0 && len(account.Code(msg.Callee)) == 0 {
+			account.SetNonce(msg.Callee, 1)
+		}
+	}
+
 	if msg.Value != nil && msg.Value.Sign() > 0 {
 		account.SubBalance(msg.Caller, msg.Value)
 		account.AddBalance(msg.Callee, msg.Value)
-	}
-
-	// For contract creation, create the target account if it does not exist.
-	if msg.IsCreate && !account.Exists(msg.Callee) {
-		account.CreateAccount(msg.Callee)
 	}
 
 	if precompile, ok := evm.resolvePrecompile(msg.CodeAddr); ok {
@@ -97,8 +106,7 @@ func (evm *EVM) ExecuteMessage(msg *Message) (*ExecutionResult, error) {
 	// Build child state
 	childState := evm.newChildState(msg)
 	childEVM := NewEVM(childState, evm.fork, evm.precompiles)
-	childEVM.returnData = evm.returnData // inherit return data buffer initially
-	childEVM.SetHooks(evm.hooks)         // propagate hooks/breakpoints to child
+	childEVM.SetHooks(evm.hooks) // propagate hooks/breakpoints to child
 
 	res, err := childEVM.Run(code)
 	if err != nil && res == nil {
@@ -281,6 +289,23 @@ func opCallCommon(evm *EVM, kind CallKind) error {
 		Kind:      kind,
 	}
 
+	hookType := HookTypeExternalCall
+	opcode := byte(0xF1)
+	switch kind {
+	case CallKindCallCode:
+		hookType = HookTypeCallCode
+		opcode = 0xF2
+	case CallKindDelegateCall:
+		hookType = HookTypeDelegateCall
+		opcode = 0xF4
+	case CallKindStaticCall:
+		hookType = HookTypeStaticCall
+		opcode = 0xFA
+	}
+	if err := evm.dispatchCallHook(opcode, hookType, &CallInfo{Kind: hookType, Caller: caller, Callee: callee, Input: input, Value: value, Gas: childGas, CodeAddr: codeAddr}); err != nil {
+		return err
+	}
+
 	res, err := evm.ExecuteMessage(msg)
 	if err != nil && res == nil {
 		res = &ExecutionResult{Status: StatusHalt, Err: err}
@@ -296,16 +321,20 @@ func opCallCommon(evm *EVM, kind CallKind) error {
 		evm.gasMeter.RefundGas(res.GasRefund)
 	}
 
-	// Copy return data to parent
-	if res != nil && len(res.ReturnData) > 0 {
-		evm.returnData = res.ReturnData
-		toCopy := outSize
-		if toCopy > uint64(len(res.ReturnData)) {
-			toCopy = uint64(len(res.ReturnData))
+	// EIP-211 semantics: each call overwrites parent return-data buffer, even when empty.
+	if res != nil {
+		evm.returnData = append(evm.returnData[:0], res.ReturnData...)
+		if len(res.ReturnData) > 0 {
+			toCopy := outSize
+			if toCopy > uint64(len(res.ReturnData)) {
+				toCopy = uint64(len(res.ReturnData))
+			}
+			copyData := make([]byte, toCopy)
+			copy(copyData, res.ReturnData[:toCopy])
+			evm.memory.Set(outOffset, copyData)
 		}
-		copyData := make([]byte, toCopy)
-		copy(copyData, res.ReturnData[:toCopy])
-		evm.memory.Set(outOffset, copyData)
+	} else {
+		evm.returnData = evm.returnData[:0]
 	}
 
 	success := res != nil && res.Status == StatusSuccess
@@ -320,27 +349,21 @@ func opCallCommon(evm *EVM, kind CallKind) error {
 
 // createAddress computes the address for CREATE.
 func createAddress(caller Address, nonce uint64) Address {
-	data, _ := rlpEncodeList([]interface{}{
-		caller[:],
-		nonce,
-	})
-	h := keccak256(data)
+	var gethCaller gethcommon.Address
+	copy(gethCaller[:], caller[:])
+	gethAddr := gethcrypto.CreateAddress(gethCaller, nonce)
 	var addr Address
-	copy(addr[:], h[12:])
+	copy(addr[:], gethAddr[:])
 	return addr
 }
 
 // create2Address computes the address for CREATE2.
 func create2Address(caller Address, salt Hash, initCode []byte) Address {
-	initHash := keccak256(initCode)
-	data := make([]byte, 1+20+32+32)
-	data[0] = 0xff
-	copy(data[1:21], caller[:])
-	copy(data[21:53], salt[:])
-	copy(data[53:85], initHash)
-	h := keccak256(data)
+	var gethCaller gethcommon.Address
+	copy(gethCaller[:], caller[:])
+	gethAddr := gethcrypto.CreateAddress2(gethCaller, salt, gethcrypto.Keccak256(initCode))
 	var addr Address
-	copy(addr[:], h[12:])
+	copy(addr[:], gethAddr[:])
 	return addr
 }
 

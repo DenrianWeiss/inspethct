@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"inspethct/internal/contractmeta"
 	"inspethct/internal/engine"
 	"inspethct/internal/forkengine"
 	"inspethct/internal/forkengine/ext"
@@ -22,17 +23,37 @@ type Server struct {
 	sessionID uint64
 	mu        sync.Mutex
 	sessions  map[string]*ReplaySession
+	mode      serverMode
 }
 
+type serverMode string
+
+const (
+	serverModeFull    serverMode = "full"
+	serverModeGDBOnly serverMode = "gdb-only"
+)
+
 type ReplaySession struct {
-	ID         string                       `json:"id"`
-	TargetTx   string                       `json:"targetTx"`
-	Exact      bool                         `json:"exact"`
-	Limitation string                       `json:"limitation,omitempty"`
-	Position   int                          `json:"position"`
-	Done       bool                         `json:"done"`
-	Result     *engine.ExecutionResult      `json:"result,omitempty"`
-	Trace      []forkengine.ReplayTraceStep `json:"trace"`
+	Kind         string                          `json:"kind"`
+	ID           string                          `json:"id"`
+	TargetTx     string                          `json:"targetTx"`
+	Exact        bool                            `json:"exact"`
+	Limitation   string                          `json:"limitation,omitempty"`
+	Position     int                             `json:"position"`
+	Done         bool                            `json:"done"`
+	Result       *engine.ExecutionResult         `json:"result,omitempty"`
+	Trace        []forkengine.ReplayTraceStep    `json:"trace"`
+	Current      *ReplayPause                    `json:"current,omitempty"`
+	Breakpoints  []DebugBreakpoint               `json:"breakpoints,omitempty"`
+	Mutations    []ReplayMutation                `json:"mutations,omitempty"`
+	Bundles      map[string]*contractmeta.Bundle `json:"-"`
+	TxHash       engine.Hash                     `json:"-"`
+	CodeAddr     *engine.Address                 `json:"-"`
+	TargetAddr   *engine.Address                 `json:"-"`
+	CallRequest  *forkengine.CallRequest         `json:"-"`
+	RootInput    []byte                          `json:"-"`
+	LastStep     int                             `json:"-"`
+	PendingPause *ReplayPause                    `json:"-"`
 }
 
 type request struct {
@@ -65,7 +86,11 @@ type callArgs struct {
 }
 
 func NewServer(engineRef *forkengine.Engine) *Server {
-	return &Server{engine: engineRef, sessions: make(map[string]*ReplaySession)}
+	return &Server{engine: engineRef, sessions: make(map[string]*ReplaySession), mode: serverModeFull}
+}
+
+func NewGDBServer(engineRef *forkengine.Engine) *Server {
+	return &Server{engine: engineRef, sessions: make(map[string]*ReplaySession), mode: serverModeGDBOnly}
 }
 
 func (server *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +114,12 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (server *Server) handle(ctx context.Context, req request) (any, *respError) {
+	if !server.methodAllowed(req.Method) {
+		return nil, &respError{Code: -32601, Message: fmt.Sprintf("method %s not available on dbgserver", req.Method)}
+	}
 	switch req.Method {
+	case "dbgserver.capabilities":
+		return server.capabilities(), nil
 	case "eth_chainId":
 		chainID, err := server.engine.ChainID(ctx)
 		if err != nil {
@@ -156,6 +186,8 @@ func (server *Server) handle(ctx context.Context, req request) (any, *respError)
 			return nil, rpcErr
 		}
 		return server.startReplaySession(ctx, txHash)
+	case "gdb.startCallSession":
+		return server.startCallSession(ctx, req.Params)
 	case "gdb.next":
 		sessionID, rpcErr := decodeStringParam(req.Params)
 		if rpcErr != nil {
@@ -174,8 +206,67 @@ func (server *Server) handle(ctx context.Context, req request) (any, *respError)
 			return nil, rpcErr
 		}
 		return server.sessionState(sessionID)
+	case "gdb.loadSourceBundle":
+		return server.loadSourceBundle(ctx, req.Params)
+	case "gdb.setSourceBreakpoint":
+		return server.setSourceBreakpoint(req.Params)
+	case "gdb.setFunctionBreakpoint":
+		return server.setFunctionBreakpoint(req.Params)
+	case "gdb.setCallBreakpoint":
+		return server.setCallBreakpoint(req.Params)
+	case "gdb.setStorageBreakpoint":
+		return server.setStorageBreakpoint(req.Params)
+	case "gdb.setMemoryBreakpoint":
+		return server.setMemoryBreakpoint(req.Params)
+	case "gdb.listBreakpoints":
+		return server.listBreakpoints(req.Params)
+	case "gdb.deleteBreakpoint":
+		return server.deleteBreakpoint(req.Params)
+	case "gdb.writeStorage":
+		return server.writeStorage(req.Params)
+	case "gdb.writeMemory":
+		return server.writeMemory(req.Params)
 	default:
 		return nil, &respError{Code: -32601, Message: fmt.Sprintf("method %s not found", req.Method)}
+	}
+}
+
+func (server *Server) methodAllowed(method string) bool {
+	if server.mode != serverModeGDBOnly {
+		return true
+	}
+	switch method {
+	case "dbgserver.capabilities", "eth_chainId", "gdb.startReplaySession", "gdb.startCallSession", "gdb.next", "gdb.continue", "gdb.state", "gdb.loadSourceBundle", "gdb.setSourceBreakpoint", "gdb.setFunctionBreakpoint", "gdb.setCallBreakpoint", "gdb.setStorageBreakpoint", "gdb.setMemoryBreakpoint", "gdb.listBreakpoints", "gdb.deleteBreakpoint", "gdb.writeStorage", "gdb.writeMemory":
+		return true
+	default:
+		return false
+	}
+}
+
+func (server *Server) capabilities() map[string]any {
+	return map[string]any{
+		"mode": server.mode,
+		"methods": []string{
+			"gdb.startReplaySession",
+			"gdb.startCallSession",
+			"gdb.next",
+			"gdb.continue",
+			"gdb.state",
+			"gdb.loadSourceBundle",
+			"gdb.setSourceBreakpoint",
+			"gdb.setFunctionBreakpoint",
+			"gdb.setCallBreakpoint",
+			"gdb.setStorageBreakpoint",
+			"gdb.setMemoryBreakpoint",
+			"gdb.listBreakpoints",
+			"gdb.deleteBreakpoint",
+			"gdb.writeStorage",
+			"gdb.writeMemory",
+		},
+		"notes": []string{
+			"dbgserver exposes replay and call debugging sessions",
+			"source, function, call, storage, and memory breakpoints are available over RPC",
+		},
 	}
 }
 
@@ -185,7 +276,17 @@ func (server *Server) startReplaySession(ctx context.Context, txHash engine.Hash
 		return nil, internalError(err)
 	}
 	id := fmt.Sprintf("replay-%d", atomic.AddUint64(&server.sessionID, 1))
+	var targetAddr *engine.Address
+	if replay.Transaction.To != nil {
+		addr := *replay.Transaction.To
+		targetAddr = &addr
+	}
+	if targetAddr == nil && replay.Receipt.ContractAddress != nil {
+		addr := *replay.Receipt.ContractAddress
+		targetAddr = &addr
+	}
 	session := &ReplaySession{
+		Kind:       "replay",
 		ID:         id,
 		TargetTx:   hashHex(txHash),
 		Exact:      replay.Exact,
@@ -194,6 +295,39 @@ func (server *Server) startReplaySession(ctx context.Context, txHash engine.Hash
 		Done:       len(replay.LocalTrace) == 0,
 		Result:     replay.Result,
 		Trace:      append([]forkengine.ReplayTraceStep(nil), replay.LocalTrace...),
+		Bundles:    make(map[string]*contractmeta.Bundle),
+		TxHash:     txHash,
+		TargetAddr: targetAddr,
+	}
+	server.mu.Lock()
+	server.sessions[id] = session
+	server.mu.Unlock()
+	if len(replay.LocalTrace) == 0 {
+		return server.describeSession(session), nil
+	}
+	if _, rpcErr := server.advanceSessionWithContext(ctx, session, false); rpcErr != nil {
+		return nil, rpcErr
+	}
+	return server.describeSession(session), nil
+}
+
+func (server *Server) startCallSession(ctx context.Context, params []json.RawMessage) (any, *respError) {
+	callReq, rpcErr := decodeEthCall(params)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	req := forkengine.CallRequest{From: callReq.From, To: callReq.To, Input: callReq.Input, Value: callReq.Value, GasLimit: callReq.GasLimit, Block: callReq.Block}
+	id := fmt.Sprintf("call-%d", atomic.AddUint64(&server.sessionID, 1))
+	target := req.To
+	session := &ReplaySession{
+		Kind:        "call",
+		ID:          id,
+		Position:    -1,
+		Trace:       []forkengine.ReplayTraceStep{},
+		Bundles:     make(map[string]*contractmeta.Bundle),
+		TargetAddr:  &target,
+		CodeAddr:    &target,
+		CallRequest: &req,
 	}
 	server.mu.Lock()
 	server.sessions[id] = session
@@ -202,22 +336,39 @@ func (server *Server) startReplaySession(ctx context.Context, txHash engine.Hash
 }
 
 func (server *Server) advanceSession(sessionID string, all bool) (any, *respError) {
-	server.mu.Lock()
-	defer server.mu.Unlock()
-	session, ok := server.sessions[sessionID]
-	if !ok {
-		return nil, &respError{Code: -32602, Message: "unknown gdb session"}
+	return server.advanceSessionWithContext(context.Background(), nil, allSessionRequest{sessionID: sessionID, all: all})
+}
+
+type allSessionRequest struct {
+	sessionID string
+	all       bool
+}
+
+func (server *Server) advanceSessionWithContext(ctx context.Context, sessionRef any, request any) (any, *respError) {
+	var session *ReplaySession
+	switch typed := sessionRef.(type) {
+	case *ReplaySession:
+		session = typed
+	case nil:
+		server.mu.Lock()
+		req := request.(allSessionRequest)
+		var ok bool
+		session, ok = server.sessions[req.sessionID]
+		server.mu.Unlock()
+		if !ok {
+			return nil, &respError{Code: -32602, Message: "unknown gdb session"}
+		}
+	default:
+		return nil, &respError{Code: -32603, Message: "invalid session request"}
 	}
-	if len(session.Trace) == 0 {
+	if session.Kind != "call" && len(session.Trace) == 0 {
 		session.Done = true
 		return server.describeSession(session), nil
 	}
-	if all {
-		session.Position = len(session.Trace) - 1
-	} else if session.Position < len(session.Trace)-1 {
-		session.Position++
+	req, _ := request.(allSessionRequest)
+	if rpcErr := server.replaySession(ctx, session, req.all); rpcErr != nil {
+		return nil, rpcErr
 	}
-	session.Done = session.Position >= len(session.Trace)-1
 	return server.describeSession(session), nil
 }
 
@@ -233,6 +384,7 @@ func (server *Server) sessionState(sessionID string) (any, *respError) {
 
 func (server *Server) describeSession(session *ReplaySession) map[string]any {
 	state := map[string]any{
+		"kind":        session.Kind,
 		"id":          session.ID,
 		"targetTx":    session.TargetTx,
 		"exact":       session.Exact,
@@ -241,9 +393,36 @@ func (server *Server) describeSession(session *ReplaySession) map[string]any {
 		"done":        session.Done,
 		"traceLength": len(session.Trace),
 		"result":      encodeExecutionResult(session.Result),
+		"breakpoints": session.Breakpoints,
+		"mutations":   session.Mutations,
 	}
 	if session.Position >= 0 && session.Position < len(session.Trace) {
 		state["currentStep"] = session.Trace[session.Position]
+	}
+	if session.Current != nil {
+		state["current"] = session.Current
+	}
+	if session.Kind == "call" && session.CallRequest != nil {
+		state["call"] = map[string]any{
+			"from":  addressHex(session.CallRequest.From),
+			"to":    addressHex(session.CallRequest.To),
+			"input": encodeBytes(session.CallRequest.Input),
+			"value": encodeQuantity(session.CallRequest.Value),
+			"gas":   session.CallRequest.GasLimit,
+			"block": session.CallRequest.Block.CacheKey(),
+		}
+	}
+	if len(session.Bundles) > 0 {
+		loaded := make([]map[string]any, 0, len(session.Bundles))
+		for key, bundle := range session.Bundles {
+			loaded = append(loaded, map[string]any{
+				"codeAddress":     key,
+				"sourceName":      bundle.SourceName,
+				"contractName":    bundle.ContractName,
+				"compilerVersion": bundle.CompilerVersion,
+			})
+		}
+		state["bundles"] = loaded
 	}
 	return state
 }

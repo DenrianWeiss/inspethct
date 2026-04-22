@@ -1,6 +1,9 @@
 package srcmap
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // BuildConfig selects a contract artifact from Solidity standard-json output.
 type BuildConfig struct {
@@ -82,8 +85,8 @@ type InstructionMapping struct {
 
 // StorageLayout is the subset of Solidity storage layout used by the index.
 type StorageLayout struct {
-	Storage []StorageEntry          `json:"storage"`
-	Types   map[string]StorageType  `json:"types"`
+	Storage []StorageEntry         `json:"storage"`
+	Types   map[string]StorageType `json:"types"`
 }
 
 // StorageEntry represents one declared storage variable or member.
@@ -175,12 +178,12 @@ type StorageAccess struct {
 
 // MemoryAnnotation explains a runtime memory event in source terms.
 type MemoryAnnotation struct {
-	Access     MemoryAccess
+	Access      MemoryAccess
 	Instruction *InstructionMapping
-	Node       *ASTNode
-	Region     MemoryRegion
-	Confidence MemoryConfidence
-	Reason     string
+	Node        *ASTNode
+	Region      MemoryRegion
+	Confidence  MemoryConfidence
+	Reason      string
 }
 
 // StorageAnnotation explains a runtime storage event in source terms.
@@ -191,19 +194,90 @@ type StorageAnnotation struct {
 	Reason      string
 }
 
+// ABIEntry is a compact ABI item representation retained from compiler output.
+type ABIEntry struct {
+	Type            string         `json:"type"`
+	Name            string         `json:"name,omitempty"`
+	StateMutability string         `json:"stateMutability,omitempty"`
+	Anonymous       bool           `json:"anonymous,omitempty"`
+	Inputs          []ABIParameter `json:"inputs,omitempty"`
+	Outputs         []ABIParameter `json:"outputs,omitempty"`
+}
+
+// ABIParameter represents one ABI argument or return value.
+type ABIParameter struct {
+	Name         string         `json:"name,omitempty"`
+	Type         string         `json:"type,omitempty"`
+	InternalType string         `json:"internalType,omitempty"`
+	Components   []ABIParameter `json:"components,omitempty"`
+	Indexed      bool           `json:"indexed,omitempty"`
+}
+
+// EventDefinition captures an event ABI item for debugger and CLI display.
+type EventDefinition struct {
+	Name      string         `json:"name"`
+	Anonymous bool           `json:"anonymous,omitempty"`
+	Inputs    []ABIParameter `json:"inputs,omitempty"`
+}
+
+// FunctionDefinition captures a function-like ABI item.
+type FunctionDefinition struct {
+	Type            string         `json:"type"`
+	Name            string         `json:"name,omitempty"`
+	StateMutability string         `json:"stateMutability,omitempty"`
+	Inputs          []ABIParameter `json:"inputs,omitempty"`
+	Outputs         []ABIParameter `json:"outputs,omitempty"`
+}
+
+// ContractMetadata is the extracted contract-facing information surfaced by srcmap.
+type ContractMetadata struct {
+	Build             BuildConfig              `json:"build"`
+	PersistentStorage []StorageVariableMapping `json:"persistentStorage"`
+	TransientStorage  []StorageVariableMapping `json:"transientStorage"`
+	ABI               []ABIEntry               `json:"abi"`
+	Functions         []FunctionDefinition     `json:"functions"`
+	Events            []EventDefinition        `json:"events"`
+}
+
 // Index is the main bidirectional lookup structure.
 type Index struct {
-	Build                  BuildConfig
-	Sources                map[int]*SourceFile
-	Instructions           []InstructionMapping
-	InstructionByPC        map[uint64]*InstructionMapping
-	NodesByID              map[int]*ASTNode
-	NodesBySourceID        map[int][]*ASTNode
-	StorageVariables       []StorageVariableMapping
-	TransientVariables     []StorageVariableMapping
-	PersistentLayout       StorageLayout
-	TransientLayout        StorageLayout
-	CreationBytecode       []byte
-	RuntimeBytecode        []byte
-	GeneratedSourceIDs     map[int]struct{}
+	Build              BuildConfig
+	Sources            map[int]*SourceFile
+	Instructions       []InstructionMapping
+	InstructionByPC    map[uint64]*InstructionMapping
+	NodesByID          map[int]*ASTNode
+	NodesBySourceID    map[int][]*ASTNode
+	StorageVariables   []StorageVariableMapping
+	TransientVariables []StorageVariableMapping
+	PersistentLayout   StorageLayout
+	TransientLayout    StorageLayout
+	ABI                []ABIEntry
+	Functions          []FunctionDefinition
+	Events             []EventDefinition
+	CreationBytecode   []byte
+	RuntimeBytecode    []byte
+	GeneratedSourceIDs map[int]struct{}
+}
+
+// ABIJSON returns the canonical ABI JSON for the indexed contract.
+func (idx *Index) ABIJSON() ([]byte, error) {
+	if idx == nil {
+		return json.Marshal([]ABIEntry(nil))
+	}
+	return json.Marshal(idx.ABI)
+}
+
+// Metadata returns extracted contract metadata for debugger and CLI consumers.
+func (idx *Index) Metadata() ContractMetadata {
+	if idx == nil {
+		return ContractMetadata{}
+	}
+	return ContractMetadata{
+		Build:             idx.Build,
+		PersistentStorage: append([]StorageVariableMapping(nil), idx.StorageVariables...),
+		TransientStorage:  append([]StorageVariableMapping(nil), idx.TransientVariables...),
+		ABI:               append([]ABIEntry(nil), idx.ABI...),
+		Functions:         append([]FunctionDefinition(nil), idx.Functions...),
+		Events:            append([]EventDefinition(nil), idx.Events...),
+	}
 }

@@ -284,6 +284,8 @@ type ReadOnlyState interface {
 	ContractCallValue() *big.Int
 	// ContractCode returns the code currently being executed.
 	ContractCode() []byte
+	// ContractCodeAddr returns the address whose code is currently executing.
+	ContractCodeAddr() Address
 	// Logs returns the logs emitted so far.
 	Logs() []Log
 	// IsAddressWarmed returns true if the address is in the access list.

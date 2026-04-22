@@ -31,7 +31,8 @@ func opCreate(evm *EVM, create2 bool) error {
 	// Memory expansion
 	memGas, _ := evm.memory.ExpandSize(offset, size)
 
-	var gasCost uint64 = GasCreate + memGas
+	// Base CREATE gas is already charged by the interpreter loop.
+	var gasCost uint64 = memGas
 	if create2 {
 		words := (size + 31) / 32
 		gasCost += words * 6
@@ -58,8 +59,8 @@ func opCreate(evm *EVM, create2 bool) error {
 	} else {
 		nonce := account.Nonce(caller)
 		addr = createAddress(caller, nonce)
-		account.IncrementNonce(caller)
 	}
+	account.IncrementNonce(caller)
 
 	// Address collision check
 	if account.HasCodeOrNonce(addr) {
@@ -172,14 +173,16 @@ func opDelegatecall(evm *EVM) error {
 func opReturn(evm *EVM) error {
 	offset := wordToUint64(evm.stack.Pop())
 	size := wordToUint64(evm.stack.Pop())
-	evm.returnData = evm.memory.Get(offset, size)
+	evm.outputData = evm.memory.Get(offset, size)
+	evm.returnData = evm.outputData
 	return ErrHalt
 }
 
 func opRevert(evm *EVM) error {
 	offset := wordToUint64(evm.stack.Pop())
 	size := wordToUint64(evm.stack.Pop())
-	evm.returnData = evm.memory.Get(offset, size)
+	evm.outputData = evm.memory.Get(offset, size)
+	evm.returnData = evm.outputData
 	return ErrExecutionReverted
 }
 

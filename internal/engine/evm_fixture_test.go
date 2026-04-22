@@ -235,18 +235,19 @@ func runStateFixtureFile(t *testing.T, path string, total, skipped, passed, fail
 					acc, sto := clonePreState(fix.Pre)
 					sender := hexToAddr(fix.Transaction.Sender)
 					to := hexToAddr(fix.Transaction.To)
+					isCreateTx := strings.TrimSpace(fix.Transaction.To) == "" || strings.TrimSpace(fix.Transaction.To) == "0x"
+					createNonce := acc.Nonce(sender)
 					dataBytes := hexToBytes(fix.Transaction.Data[entry.Indexes.Data])
 					gasLimit := hexToBig(fix.Transaction.GasLimit[entry.Indexes.Gas]).Uint64()
 					value := hexToBig(fix.Transaction.Value[entry.Indexes.Value])
 					gasPrice := hexToBig(fix.Transaction.GasPrice)
 					acc.IncrementNonce(sender)
-					if value.Sign() > 0 {
-						if acc.Balance(sender).Cmp(value) < 0 {
-							*failed = *failed + 1
-							t.Fatalf("insufficient balance for value transfer")
-						}
-						acc.SubBalance(sender, value)
-						acc.AddBalance(to, value)
+					code := acc.Code(to)
+					inputBytes := dataBytes
+					if isCreateTx {
+						to = createAddress(sender, createNonce)
+						code = dataBytes
+						inputBytes = nil
 					}
 					blockCtx := &SimpleBlockContext{
 						CoinbaseVal:   hexToAddr(fix.Env.CurrentCoinbase),
@@ -261,8 +262,7 @@ func runStateFixtureFile(t *testing.T, path string, total, skipped, passed, fail
 						blockCtx.RandomVal = hexToHash(fix.Env.CurrentRandom)
 					}
 					txCtx := &SimpleTxContext{OriginVal: sender, GasPriceVal: gasPrice}
-					code := acc.Code(to)
-					intrinsic := intrinsicGas(dataBytes)
+					intrinsic := intrinsicGasForTx(dataBytes, isCreateTx, fork)
 					evmGasLimit := gasLimit
 					if evmGasLimit > intrinsic {
 						evmGasLimit -= intrinsic
@@ -274,7 +274,7 @@ func runStateFixtureFile(t *testing.T, path string, total, skipped, passed, fail
 						Fork:             fork,
 						GasLimit:         evmGasLimit,
 						Value:            value,
-						Input:            dataBytes,
+						Input:            inputBytes,
 						Origin:           sender,
 						Caller:           sender,
 						ContractAddress:  to,
@@ -288,7 +288,13 @@ func runStateFixtureFile(t *testing.T, path string, total, skipped, passed, fail
 						AccessList:       NewSimpleAccessList(),
 					}
 					eng := NewSimpleEngine()
-					res, err := eng.Run(cfg)
+					var res *ExecutionResult
+					var err error
+					if isCreateTx {
+						res, err = runTopLevelCreateFixture(cfg, code)
+					} else {
+						res, err = eng.Run(cfg)
+					}
 					if res != nil {
 						gasUsed := gasLimit - res.GasRemaining
 						refund := res.GasRefund
@@ -308,6 +314,11 @@ func runStateFixtureFile(t *testing.T, path string, total, skipped, passed, fail
 					mismatches := compareState(acc, sto, entry.State)
 					if len(mismatches) > 0 {
 						*failed = *failed + 1
+						if res != nil {
+							t.Logf("result status=%v gasRemaining=%d gasUsed=%d refund=%d returnDataLen=%d err=%v", res.Status, res.GasRemaining, res.GasUsed, res.GasRefund, len(res.ReturnData), err)
+						} else {
+							t.Logf("result=nil err=%v", err)
+						}
 						for _, m := range mismatches {
 							t.Logf("mismatch: %s", m)
 						}
@@ -386,4 +397,80 @@ func intrinsicGas(data []byte) uint64 {
 		}
 	}
 	return gas
+}
+
+func intrinsicGasForTx(data []byte, isCreate bool, fork Fork) uint64 {
+	gas := intrinsicGas(data)
+	if !isCreate {
+		return gas
+	}
+	// Legacy contract-creation tx intrinsic overhead: 53000 instead of 21000.
+	gas += 32000
+	if forkGTE(fork, ForkShanghai) {
+		gas += ((uint64(len(data)) + 31) / 32) * GasInitCodeWord
+	}
+	return gas
+}
+
+func runTopLevelCreateFixture(cfg *ExecutionConfig, initCode []byte) (*ExecutionResult, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	if cfg.State == nil || cfg.Storage == nil || cfg.TransientStorage == nil || cfg.BlockContext == nil || cfg.TxContext == nil {
+		return nil, nil
+	}
+	stack := NewStack()
+	memory := NewMemory()
+	gasMeter := NewGasMeter(cfg.GasLimit)
+	accessList := cfg.AccessList
+	if accessList == nil {
+		accessList = NewSimpleAccessList()
+	}
+	warmInitialAccessList(accessList, cfg)
+	contract := &SimpleContract{
+		AddressVal:   cfg.Caller,
+		CallerVal:    cfg.Caller,
+		CallValueVal: big.NewInt(0),
+		CallInputVal: nil,
+		CodeVal:      nil,
+		CodeHashVal:  Hash{},
+		CodeAddrVal:  cfg.Caller,
+		IsStaticVal:  false,
+	}
+	state := NewEVMState(stack, memory, cfg.Storage, cfg.TransientStorage, cfg.State, gasMeter, cfg.BlockContext, cfg.TxContext, contract, accessList)
+	ev := NewEVM(state, cfg.Fork, cfg.Precompiles)
+	if cfg.Hooks != nil {
+		ev.SetHooks(cfg.Hooks)
+	}
+	msg := &Message{
+		Caller:    cfg.Caller,
+		Callee:    cfg.ContractAddress,
+		Value:     cfg.Value,
+		Gas:       cfg.GasLimit,
+		Input:     initCode,
+		Code:      initCode,
+		CodeAddr:  cfg.ContractAddress,
+		IsStatic:  false,
+		CallDepth: 0,
+		Kind:      CallKindCall,
+		IsCreate:  true,
+	}
+	res, err := ev.ExecuteMessage(msg)
+	if res == nil {
+		return res, err
+	}
+	if res.Status == StatusSuccess {
+		deployed := append([]byte(nil), res.ReturnData...)
+		depositGas := uint64(len(deployed)) * GasCodeDeposit
+		if res.GasRemaining < depositGas {
+			res.Status = StatusOutOfGas
+			res.Err = ErrOutOfGas
+			res.GasRemaining = 0
+		} else {
+			res.GasRemaining -= depositGas
+			cfg.State.SetCode(cfg.ContractAddress, deployed)
+		}
+	}
+	res.GasUsed = cfg.GasLimit - res.GasRemaining
+	return res, err
 }

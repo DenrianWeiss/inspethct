@@ -78,6 +78,34 @@ func (evm *EVM) dispatchStorageAccessHook(op byte, hookType HookType, access *St
 	return Hash{}, false, nil
 }
 
+func (evm *EVM) dispatchCallHook(op byte, hookType HookType, call *CallInfo) error {
+	if evm.hooks == nil {
+		return nil
+	}
+	ctx := evm.hookContextForOpcode(op)
+	ctx.Call = call
+	for _, hook := range evm.hooks.HooksFor(hookType) {
+		res, err := hook.Fire(ctx)
+		if err != nil {
+			return err
+		}
+		if res == nil {
+			continue
+		}
+		switch res.Action {
+		case ActionContinue:
+			continue
+		case ActionHalt:
+			return res.Err
+		case ActionReplaceResult:
+			return fmt.Errorf("call hook replacement is not supported")
+		case ActionRevert:
+			return ErrExecutionReverted
+		}
+	}
+	return nil
+}
+
 func normalizeAccessData(data []byte, size uint64) []byte {
 	if size == 0 {
 		return nil

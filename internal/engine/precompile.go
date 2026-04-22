@@ -14,6 +14,8 @@ import (
 
 	gokzg4844 "github.com/crate-crypto/go-kzg-4844"
 	secp256k1ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	gethcommon "github.com/ethereum/go-ethereum/common"
+	gethvm "github.com/ethereum/go-ethereum/core/vm"
 	"golang.org/x/crypto/bn256"
 	"golang.org/x/crypto/ripemd160"
 )
@@ -124,11 +126,31 @@ func MainnetPrecompilesForFork(fork Fork) *PrecompileRegistry {
 	registry.Register(precompileAddress(0x02), dynamicGasPrecompile{gas: gasSha256, run: runSha256})
 	registry.Register(precompileAddress(0x03), dynamicGasPrecompile{gas: gasRipemd160, run: runRipemd160})
 	registry.Register(precompileAddress(0x04), dynamicGasPrecompile{gas: gasIdentity, run: runIdentity})
-	registry.Register(precompileAddress(0x05), dynamicGasPrecompile{gas: gasModExp, run: runModExp})
-	registry.Register(precompileAddress(0x06), fixedGasPrecompile{gas: 150, run: runBn256Add})
-	registry.Register(precompileAddress(0x07), fixedGasPrecompile{gas: 6000, run: runBn256ScalarMul})
-	registry.Register(precompileAddress(0x08), dynamicGasPrecompile{gas: gasBn256Pairing, run: runBn256Pairing})
-	registry.Register(precompileAddress(0x09), dynamicGasPrecompile{gas: gasBlake2F, run: runBlake2F})
+	if precompile, ok := resolveGethPrecompile(fork, precompileAddress(0x05)); ok {
+		registry.Register(precompileAddress(0x05), precompile)
+	} else {
+		registry.Register(precompileAddress(0x05), dynamicGasPrecompile{gas: gasModExp, run: runModExp})
+	}
+	if precompile, ok := resolveGethPrecompile(fork, precompileAddress(0x06)); ok {
+		registry.Register(precompileAddress(0x06), precompile)
+	} else {
+		registry.Register(precompileAddress(0x06), fixedGasPrecompile{gas: 150, run: runBn256Add})
+	}
+	if precompile, ok := resolveGethPrecompile(fork, precompileAddress(0x07)); ok {
+		registry.Register(precompileAddress(0x07), precompile)
+	} else {
+		registry.Register(precompileAddress(0x07), fixedGasPrecompile{gas: 6000, run: runBn256ScalarMul})
+	}
+	if precompile, ok := resolveGethPrecompile(fork, precompileAddress(0x08)); ok {
+		registry.Register(precompileAddress(0x08), precompile)
+	} else {
+		registry.Register(precompileAddress(0x08), dynamicGasPrecompile{gas: gasBn256Pairing, run: runBn256Pairing})
+	}
+	if precompile, ok := resolveGethPrecompile(fork, precompileAddress(0x09)); ok {
+		registry.Register(precompileAddress(0x09), precompile)
+	} else {
+		registry.Register(precompileAddress(0x09), dynamicGasPrecompile{gas: gasBlake2F, run: runBlake2F})
+	}
 	if forkGTE(fork, ForkCancun) {
 		registry.Register(precompileAddress(0x0a), newPointEvaluationPrecompile())
 	}
@@ -192,6 +214,18 @@ type dynamicGasPrecompile struct {
 	run func([]byte, Fork) ([]byte, error)
 }
 
+type gethWrappedPrecompile struct {
+	inner gethvm.PrecompiledContract
+}
+
+func (p gethWrappedPrecompile) RequiredGas(input []byte, _ Fork) (uint64, error) {
+	return p.inner.RequiredGas(input), nil
+}
+
+func (p gethWrappedPrecompile) Run(input []byte, _ Fork) ([]byte, error) {
+	return p.inner.Run(input)
+}
+
 type pointEvaluationPrecompile struct {
 	ctx *gokzg4844.Context
 	err error
@@ -234,6 +268,33 @@ func precompileAddressU16(id uint16) Address {
 	var addr Address
 	binary.BigEndian.PutUint16(addr[18:], id)
 	return addr
+}
+
+func resolveGethPrecompile(fork Fork, addr Address) (Precompile, bool) {
+	contracts := gethContractsForFork(fork)
+	if contracts == nil {
+		return nil, false
+	}
+	var gethAddr gethcommon.Address
+	copy(gethAddr[:], addr[:])
+	inner, ok := contracts[gethAddr]
+	if !ok {
+		return nil, false
+	}
+	return gethWrappedPrecompile{inner: inner}, true
+}
+
+func gethContractsForFork(fork Fork) gethvm.PrecompiledContracts {
+	if forkGTE(fork, ForkPrague) {
+		return gethvm.PrecompiledContractsPrague
+	}
+	if forkGTE(fork, ForkCancun) {
+		return gethvm.PrecompiledContractsCancun
+	}
+	if forkGTE(fork, ForkLondon) {
+		return gethvm.PrecompiledContractsBerlin
+	}
+	return gethvm.PrecompiledContractsIstanbul
 }
 
 func gasSha256(input []byte, _ Fork) (uint64, error) {
@@ -507,10 +568,17 @@ func adjustedExponentLength(expLen uint64, head []byte) uint64 {
 	if expLen == 0 {
 		return 0
 	}
-	if expLen <= 32 {
-		return uint64(bitLen(head)) - 1
+	bits := bitLen(head)
+	if bits == 0 {
+		if expLen <= 32 {
+			return 0
+		}
+		return 8 * (expLen - 32)
 	}
-	return 8*(expLen-32) + uint64(bitLen(head)) - 1
+	if expLen <= 32 {
+		return uint64(bits - 1)
+	}
+	return 8*(expLen-32) + uint64(bits-1)
 }
 
 func bitLen(data []byte) int {

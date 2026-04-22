@@ -552,6 +552,8 @@ func NewReadOnlyState(state EVMState) ReadOnlyState {
 	return &readOnlyState{inner: state}
 }
 
+func (r *readOnlyState) Inner() EVMState { return r.inner }
+
 func (r *readOnlyState) StackLen() int         { return r.inner.Stack().Len() }
 func (r *readOnlyState) StackPeekN(n int) Word { return r.inner.Stack().PeekN(n) }
 func (r *readOnlyState) MemoryLen() int        { return r.inner.Memory().Len() }
@@ -582,6 +584,7 @@ func (r *readOnlyState) ContractAddress() Address      { return r.inner.Contract
 func (r *readOnlyState) ContractCaller() Address       { return r.inner.Contract().Caller() }
 func (r *readOnlyState) ContractCallValue() *big.Int   { return r.inner.Contract().CallValue() }
 func (r *readOnlyState) ContractCode() []byte          { return r.inner.Contract().Code() }
+func (r *readOnlyState) ContractCodeAddr() Address     { return r.inner.Contract().CodeAddr() }
 func (r *readOnlyState) Logs() []Log                   { return r.inner.Logs() }
 func (r *readOnlyState) IsAddressWarmed(addr Address) bool {
 	return r.inner.AccessList().IsAddressWarmed(addr)
