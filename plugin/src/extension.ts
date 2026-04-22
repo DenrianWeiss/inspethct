@@ -48,7 +48,7 @@ class InspethctConfigurationProvider implements vscode.DebugConfigurationProvide
     if (config.autoStartDbgserver) {
       const settings = vscode.workspace.getConfiguration("inspethct", folder?.uri);
       const configuredBinary = config.dbgserverBinaryPath || settings.get<string>("binaryPath");
-      const resolvedBinary = await this.processManager.resolveBinary(configuredBinary);
+      const resolvedBinary = await this.processManager.resolveOrDownloadBinary(configuredBinary);
       if (!resolvedBinary) {
         const action = await vscode.window.showErrorMessage(
           "Cannot find inspethctd. Install it (go install ./cmd/inspethctd) or set inspethct.binaryPath.",
@@ -103,7 +103,7 @@ class InspethctConfigurationProvider implements vscode.DebugConfigurationProvide
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Inspethct");
-  const processManager = new DbgserverProcessManager((line) => output.appendLine(line));
+  const processManager = new DbgserverProcessManager(context, (line) => output.appendLine(line));
   const configProvider = new InspethctConfigurationProvider(processManager);
   const adapterFactory = new InspethctDebugAdapterFactory(processManager);
   const codeLensProvider = new SolidityFunctionCodeLensProvider();

@@ -1,6 +1,11 @@
 import { ChildProcess, execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
+import * as vscode from "vscode";
 import { RpcClient } from "./rpcClient";
+import { tryDownloadLatestBinary } from "./githubRelease";
 
 const execFileAsync = promisify(execFile);
 
@@ -25,7 +30,10 @@ export class DbgserverProcessManager {
   private readonly recentStderr = new Map<string, string[]>();
   private readonly recentStdout = new Map<string, string[]>();
 
-  constructor(private readonly debugLog?: (line: string) => void) {}
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly debugLog?: (line: string) => void
+  ) {}
 
   async resolveBinary(configPath?: string): Promise<string | undefined> {
     if (configPath && configPath.trim() !== "") {
@@ -34,10 +42,55 @@ export class DbgserverProcessManager {
     try {
       const { stdout } = await execFileAsync("which", ["inspethctd"]);
       const resolved = stdout.trim();
-      return resolved.length > 0 ? resolved : undefined;
+      if (resolved.length > 0) {
+        return resolved;
+      }
     } catch {
+      // not found in PATH
+    }
+    // Try cached download
+    const cached = this.cachedBinaryPath();
+    if (cached && fs.existsSync(cached)) {
+      return cached;
+    }
+    return undefined;
+  }
+
+  async resolveOrDownloadBinary(configPath?: string): Promise<string | undefined> {
+    const resolved = await this.resolveBinary(configPath);
+    if (resolved) {
+      return resolved;
+    }
+    return tryDownloadLatestBinary(this.context);
+  }
+
+  private cachedBinaryPath(): string | undefined {
+    const assetName = this.platformAssetName();
+    if (!assetName) {
       return undefined;
     }
+    return path.join(this.context.globalStorageUri.fsPath, "bin", assetName);
+  }
+
+  private platformAssetName(): string | undefined {
+    const platform = os.platform();
+    const arch = os.arch();
+    if (platform === "darwin" && arch === "arm64") {
+      return "inspethctd-darwin-arm64";
+    }
+    if (platform === "darwin" && arch === "x64") {
+      return "inspethctd-darwin-amd64";
+    }
+    if (platform === "linux" && arch === "arm64") {
+      return "inspethctd-linux-arm64";
+    }
+    if (platform === "linux" && arch === "x64") {
+      return "inspethctd-linux-amd64";
+    }
+    if (platform === "win32" && arch === "x64") {
+      return "inspethctd-windows-amd64.exe";
+    }
+    return undefined;
   }
 
   async start(config: ManagedProcessConfig): Promise<ProcessStartResult> {
