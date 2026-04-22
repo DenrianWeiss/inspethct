@@ -13,9 +13,11 @@ This extension provides interactive Solidity debugging through inspethctd dbgser
 - Solidity function entry CodeLens for one-click debug launch.
 - Source breakpoints synced from VS Code editor to gdb.setSourceBreakpoint.
 - Source bundle selection prompt at session launch.
+- Native sequence session integration (`gdb.startSequenceSession` / `gdb.nextStepSession`) when backend supports it.
+- State patch integration (`gdb.exportStatePatch` / `gdb.importStatePatch`) via backend-native sequence carry.
 
-## Current Limitation (Sequence)
+## Compatibility
 
-The current dbgserver API has no direct snapshot import/export method in gdb-only mode.
-Sequence carry-over currently reuses user mutation journal (gdb.writeStorage/writeMemory),
-which captures intentional debug edits, not all state diffs.
+- The extension detects `dbgserver.capabilities.features`.
+- If `sequenceSession=true`, sequence debugging uses backend-native orchestration and patch carry.
+- If unavailable, extension falls back to legacy per-step call sessions with mutation-journal carry.

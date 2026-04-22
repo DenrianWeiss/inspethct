@@ -46,7 +46,10 @@ Example call config:
 
 Use sessionType sequence with sequence array. Each item is equivalent to one call object.
 
-Note: current carry-over uses user mutation journal only (gdb.writeStorage/writeMemory).
+Sequence carry-over behavior:
+
+- If backend advertises `features.sequenceSession=true`, plugin uses native sequence session with backend patch carry.
+- Otherwise plugin falls back to mutation-journal carry (`gdb.writeStorage`/`gdb.writeMemory`).
 
 Visual mode:
 

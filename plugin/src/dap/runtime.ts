@@ -3,6 +3,16 @@ import { RpcClient } from "../services/rpcClient";
 import { DbgserverProcessManager } from "../services/processManager";
 import { InspethctLaunchConfig, SequenceStep } from "../types";
 
+interface DbgserverCapabilities {
+  mode?: string;
+  methods?: string[];
+  features?: {
+    statePatch?: boolean;
+    sequenceSession?: boolean;
+    tupleAbiAssist?: boolean;
+  };
+}
+
 export interface GdbSessionState {
   kind: "replay" | "call";
   id: string;
@@ -48,6 +58,18 @@ interface RuntimeSequenceState {
   index: number;
   steps: SequenceStep[];
   carryMutations: Array<Record<string, unknown>>;
+  usingNativeSequence: boolean;
+  sequenceId?: string;
+}
+
+interface NativeSequenceResponse {
+  sequenceId: string;
+  requestedStateCarry?: string;
+  stateCarry?: string;
+  currentStepIndex: number;
+  done: boolean;
+  activeSessionId?: string;
+  activeSession?: GdbSessionState;
 }
 
 export class InspethctRuntime {
@@ -59,6 +81,7 @@ export class InspethctRuntime {
   private readonly managedProcessKey: string;
   private readonly sourcePathToName = new Map<string, string>();
   private readonly sourcePathToBreakpointIds = new Map<string, string[]>();
+  private capabilities?: DbgserverCapabilities;
 
   constructor(
     private readonly processManager: DbgserverProcessManager,
@@ -71,7 +94,7 @@ export class InspethctRuntime {
   async start(): Promise<GdbSessionState> {
     this.endpoint = await this.resolveEndpoint();
     this.rpc = new RpcClient(this.endpoint);
-    await this.rpc.call("dbgserver.capabilities", []);
+    this.capabilities = await this.rpc.call<DbgserverCapabilities>("dbgserver.capabilities", []);
 
     const sessionType = this.launch.sessionType ?? "replay";
     if (sessionType === "sequence") {
@@ -79,8 +102,13 @@ export class InspethctRuntime {
       if (steps.length === 0) {
         throw new Error("sequence mode requires at least one sequence step");
       }
-      this.sequence = { index: 0, steps, carryMutations: [] };
-      this.lastState = await this.startCallSession(steps[0]);
+      const useNativeSequence = this.capabilities?.features?.sequenceSession === true;
+      this.sequence = { index: 0, steps, carryMutations: [], usingNativeSequence: useNativeSequence };
+      if (useNativeSequence) {
+        this.lastState = await this.startNativeSequenceSession(steps);
+      } else {
+        this.lastState = await this.startCallSession(steps[0]);
+      }
     } else if (sessionType === "call") {
       if (!this.launch.call) {
         throw new Error("call mode requires call object");
@@ -244,6 +272,45 @@ export class InspethctRuntime {
     return stepped;
   }
 
+  private async startNativeSequenceSession(steps: SequenceStep[]): Promise<GdbSessionState> {
+    this.ensureRpc();
+    const payloadSteps = steps.map((step, index) => ({
+      kind: "call",
+      label: step.label || `step-${index + 1}`,
+      request: {
+        from: step.from,
+        to: step.to,
+        input: step.input,
+        value: step.value ?? "0x0",
+        gas: step.gas ?? "0x0"
+      },
+      block: step.block ?? this.launch.block ?? "latest"
+    }));
+
+    const carry = this.launch.carryUserMutations === false ? "none" : "full";
+    const response = await this.rpc!.call<NativeSequenceResponse>("gdb.startSequenceSession", [
+      {
+        steps: payloadSteps,
+        stateCarry: carry
+      }
+    ]);
+
+    if (!response.sequenceId) {
+      throw new Error("native sequence did not return sequenceId");
+    }
+    if (!response.activeSessionId || !response.activeSession) {
+      throw new Error("native sequence did not return active session");
+    }
+
+    this.sequence = this.sequence || { index: 0, steps, carryMutations: [], usingNativeSequence: true };
+    this.sequence.sequenceId = response.sequenceId;
+    this.sequence.index = response.currentStepIndex;
+    this.sequence.usingNativeSequence = true;
+    this.sessionId = response.activeSessionId;
+
+    return response.activeSession;
+  }
+
   private resolveSourceName(filePath: string): string {
     const root = (this.launch as InspethctLaunchConfig & { workspaceRoot?: string }).workspaceRoot;
     if (!root) {
@@ -255,6 +322,33 @@ export class InspethctRuntime {
 
   private async handleSequenceProgress(): Promise<void> {
     if (!this.sequence || !this.lastState?.done) {
+      return;
+    }
+
+    if (this.sequence.usingNativeSequence && this.sequence.sequenceId) {
+      const advanced = await this.rpc!.call<NativeSequenceResponse>("gdb.nextStepSession", [this.sequence.sequenceId]);
+      if (advanced.done) {
+        this.lastState = { ...this.lastState, done: true, current: undefined };
+        return;
+      }
+      if (!advanced.activeSessionId || !advanced.activeSession) {
+        throw new Error("native sequence advance missing active session");
+      }
+      this.sessionId = advanced.activeSessionId;
+      this.sequence.index = advanced.currentStepIndex;
+      this.lastState = advanced.activeSession;
+
+      if (this.launch.sourceBundle) {
+        this.lastState = await this.rpc!.call<GdbSessionState>("gdb.loadSourceBundle", [this.sessionId, this.launch.sourceBundle]);
+      }
+
+      for (const [filePath, _] of this.sourcePathToBreakpointIds.entries()) {
+        const lineIds = this.sourcePathToBreakpointIds.get(filePath) ?? [];
+        const lines = lineIds
+          .map((id) => Number.parseInt(id.slice(id.lastIndexOf("-") + 1), 10))
+          .filter((line) => Number.isFinite(line));
+        await this.setSourceBreakpoints(filePath, lines);
+      }
       return;
     }
 
