@@ -16,7 +16,7 @@ type EVM struct {
 	pc          uint64
 	returnData  []byte
 	outputData  []byte
-	jumpdests   map[uint64]bool
+	jumpdests   []bool // bitmap indexed by code offset
 	hooks       HookRegistry
 }
 
@@ -67,7 +67,6 @@ func NewEVM(state EVMState, fork Fork, registries ...*PrecompileRegistry) *EVM {
 		gasMeter:    state.GasMeter(),
 		stack:       state.Stack(),
 		memory:      state.Memory(),
-		jumpdests:   make(map[uint64]bool),
 	}
 }
 
@@ -119,7 +118,6 @@ func (evm *EVM) Run(code []byte) (res *ExecutionResult, err error) {
 		}
 
 		op := code[evm.pc]
-		opName := OpcodeName(op)
 
 		// Check fork availability
 		minFork := MinForkForOpcode(op)
@@ -156,7 +154,7 @@ func (evm *EVM) Run(code []byte) (res *ExecutionResult, err error) {
 		}
 
 		// Hook dispatch
-		if skip, err := evm.dispatchHooks(op, opName, gasBefore, totalGas); err != nil {
+		if skip, err := evm.dispatchHooks(op, gasBefore, totalGas); err != nil {
 			status := classifyError(err)
 			builder.SetStatus(status)
 			builder.SetError(err)
@@ -189,7 +187,6 @@ func (evm *EVM) Run(code []byte) (res *ExecutionResult, err error) {
 			return builder.Build(), err
 		}
 
-		_ = opName // available for tracing
 	}
 }
 
@@ -605,9 +602,15 @@ func (evm *EVM) calcDynamicGas(op byte, code []byte) (uint64, error) {
 }
 
 // dispatchHooks fires registered hooks for the current opcode step.
-// Returns (skipExecution bool, err error).
-func (evm *EVM) dispatchHooks(op byte, opName string, gasRemaining uint64, gasCost uint64) (bool, error) {
+// Returns (skipExecution bool, err error). Fast path: if no opcode/step hooks
+// are registered, we avoid all allocations and return immediately.
+func (evm *EVM) dispatchHooks(op byte, gasRemaining uint64, gasCost uint64) (bool, error) {
 	if evm.hooks == nil {
+		return false, nil
+	}
+	opcodeHooks := evm.hooks.HooksFor(HookTypeOpcode)
+	stepHooks := evm.hooks.HooksFor(HookTypeStep)
+	if len(opcodeHooks) == 0 && len(stepHooks) == 0 {
 		return false, nil
 	}
 
@@ -622,9 +625,8 @@ func (evm *EVM) dispatchHooks(op byte, opName string, gasRemaining uint64, gasCo
 		Opcode: info,
 	}
 
-	types := []HookType{HookTypeOpcode, HookTypeStep}
-	for _, ht := range types {
-		for _, hook := range evm.hooks.HooksFor(ht) {
+	for _, hooks := range [...][]Hook{opcodeHooks, stepHooks} {
+		for _, hook := range hooks {
 			res, err := hook.Fire(ctx)
 			if err != nil {
 				return false, err
@@ -653,12 +655,19 @@ func (evm *EVM) dispatchHooks(op byte, opName string, gasRemaining uint64, gasCo
 	return false, nil
 }
 
-// analyzeJumpdests scans code and marks all JUMPDEST locations.
+// analyzeJumpdests scans code and marks all JUMPDEST locations into a bitmap
+// indexed by code offset. PUSH operands are skipped so push data containing
+// a 0x5B byte is not treated as a JUMPDEST.
 func (evm *EVM) analyzeJumpdests(code []byte) {
+	if len(code) == 0 {
+		evm.jumpdests = nil
+		return
+	}
+	dests := make([]bool, len(code))
 	for i := 0; i < len(code); {
 		op := code[i]
 		if op == 0x5B {
-			evm.jumpdests[uint64(i)] = true
+			dests[i] = true
 			i++
 		} else if op >= 0x60 && op <= 0x7F {
 			i += int(op-0x60) + 2
@@ -666,6 +675,12 @@ func (evm *EVM) analyzeJumpdests(code []byte) {
 			i++
 		}
 	}
+	evm.jumpdests = dests
+}
+
+// isJumpdest reports whether dest is a valid JUMPDEST in the current code.
+func (evm *EVM) isJumpdest(dest uint64) bool {
+	return dest < uint64(len(evm.jumpdests)) && evm.jumpdests[dest]
 }
 
 // classifyError maps execution errors to ExecutionStatus.
@@ -692,18 +707,21 @@ func classifyError(err error) ExecutionStatus {
 	}
 }
 
+// forkOrder gives a monotonic rank for each known fork. Looking up a Fork
+// constant in this map is allocation-free, unlike rebuilding the map per call.
+var forkOrder = map[Fork]int{
+	ForkLondon:    0,
+	ForkParis:     1,
+	ForkShanghai:  2,
+	ForkCancun:    3,
+	ForkPrague:    4,
+	ForkAmsterdam: 5,
+	ForkOsaka:     6,
+}
+
 // forkGTE returns true if fork a is >= fork b in the fork timeline.
 func forkGTE(a, b Fork) bool {
-	order := map[Fork]int{
-		ForkLondon:    0,
-		ForkParis:     1,
-		ForkShanghai:  2,
-		ForkCancun:    3,
-		ForkPrague:    4,
-		ForkAmsterdam: 5,
-		ForkOsaka:     6,
-	}
-	return order[a] >= order[b]
+	return forkOrder[a] >= forkOrder[b]
 }
 
 // accessCostAddress returns the cold/warm access cost for an address (Berlin+).

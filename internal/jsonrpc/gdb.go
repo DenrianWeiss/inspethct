@@ -213,15 +213,18 @@ func (server *Server) replaySession(ctx context.Context, session *ReplaySession,
 	session.LastStep = -1
 	session.PendingPause = nil
 	session.Current = nil
-	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, (&debugStepHook{session: session, continueMode: continueMode}).registry())
-	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, newCallHook(session, engine.HookTypeExternalCall, "jsonrpc-call").registry())
-	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, newCallHook(session, engine.HookTypeDelegateCall, "jsonrpc-delegatecall").registry())
-	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, newCallHook(session, engine.HookTypeStaticCall, "jsonrpc-staticcall").registry())
-	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, newCallHook(session, engine.HookTypeCallCode, "jsonrpc-callcode").registry())
-	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, newStorageHook(session, engine.HookTypeStorageRead, engine.HookTypeTransientLoad, "jsonrpc-storage-read", false).registry())
-	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, newStorageHook(session, engine.HookTypeStorageWrite, engine.HookTypeTransientStore, "jsonrpc-storage-write", true).registry())
-	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, newMemoryHook(session, engine.HookTypeMemoryRead, "jsonrpc-memory-read", false).registry())
-	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, newMemoryHook(session, engine.HookTypeMemoryWrite, "jsonrpc-memory-write", true).registry())
+
+	debugHooks := engine.NewSimpleHookRegistry()
+	_ = debugHooks.Register(&debugStepHook{session: session, continueMode: continueMode})
+	_ = debugHooks.Register(newCallHook(session, engine.HookTypeExternalCall, "jsonrpc-call"))
+	_ = debugHooks.Register(newCallHook(session, engine.HookTypeDelegateCall, "jsonrpc-delegatecall"))
+	_ = debugHooks.Register(newCallHook(session, engine.HookTypeStaticCall, "jsonrpc-staticcall"))
+	_ = debugHooks.Register(newCallHook(session, engine.HookTypeCallCode, "jsonrpc-callcode"))
+	_ = debugHooks.Register(newStorageHook(session, engine.HookTypeStorageRead, engine.HookTypeTransientLoad, "jsonrpc-storage-read", false))
+	_ = debugHooks.Register(newStorageHook(session, engine.HookTypeStorageWrite, engine.HookTypeTransientStore, "jsonrpc-storage-write", true))
+	_ = debugHooks.Register(newMemoryHook(session, engine.HookTypeMemoryRead, "jsonrpc-memory-read", false))
+	_ = debugHooks.Register(newMemoryHook(session, engine.HookTypeMemoryWrite, "jsonrpc-memory-write", true))
+	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, debugHooks)
 	result, execErr := server.engine.ExecutePreparedCall(prepared)
 	if execErr != nil && !errors.Is(execErr, errReplayPause) && result == nil {
 		return internalError(execErr)
@@ -823,9 +826,9 @@ func (server *Server) setMemoryBreakpoint(params []json.RawMessage) (any, *respE
 			breakpoint.CodeAddress = addressHex(addr)
 		}
 	}
-	breakpoint.Display = fmt.Sprintf("memory %#x %d %s", breakpoint.Offset, maxUint64(breakpoint.Size, 1), breakpoint.Access)
+	breakpoint.Display = fmt.Sprintf("memory %#x %d %s", breakpoint.Offset, max(breakpoint.Size, uint64(1)), breakpoint.Access)
 	if breakpoint.SourceName != "" {
-		breakpoint.Display += fmt.Sprintf(" at %s:%d:%d", breakpoint.SourceName, breakpoint.Line, maxInt(breakpoint.Column, 1))
+		breakpoint.Display += fmt.Sprintf(" at %s:%d:%d", breakpoint.SourceName, breakpoint.Line, max(breakpoint.Column, 1))
 	}
 	if request.ID != "" {
 		breakpoint.ID = request.ID
@@ -1029,24 +1032,7 @@ func resolveSourceBreakpointPCs(bundle *contractmeta.Bundle, sourceName string, 
 }
 
 func (server *Server) decodeSessionAndBundleRequest(params []json.RawMessage) (*ReplaySession, sourceBundleRequest, *respError) {
-	if len(params) < 2 {
-		return nil, sourceBundleRequest{}, &respError{Code: -32602, Message: "expected session ID and bundle config"}
-	}
-	sessionID, rpcErr := decodeStringParam(params[:1])
-	if rpcErr != nil {
-		return nil, sourceBundleRequest{}, rpcErr
-	}
-	server.mu.Lock()
-	session := server.sessions[sessionID]
-	server.mu.Unlock()
-	if session == nil {
-		return nil, sourceBundleRequest{}, &respError{Code: -32602, Message: "unknown gdb session"}
-	}
-	var request sourceBundleRequest
-	if err := json.Unmarshal(params[1], &request); err != nil {
-		return nil, sourceBundleRequest{}, &respError{Code: -32602, Message: err.Error()}
-	}
-	return session, request, nil
+	return decodeSessionAndRequest[sourceBundleRequest](server, params)
 }
 
 func (server *Server) decodeSessionOnly(params []json.RawMessage) (*ReplaySession, *respError) {
@@ -1057,6 +1043,12 @@ func (server *Server) decodeSessionOnly(params []json.RawMessage) (*ReplaySessio
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
+	return server.lookupSession(sessionID)
+}
+
+// lookupSession resolves a session ID to its ReplaySession or returns an
+// "unknown gdb session" RPC error.
+func (server *Server) lookupSession(sessionID string) (*ReplaySession, *respError) {
 	server.mu.Lock()
 	session := server.sessions[sessionID]
 	server.mu.Unlock()
@@ -1075,11 +1067,9 @@ func decodeSessionAndRequest[T any](server *Server, params []json.RawMessage) (*
 	if rpcErr != nil {
 		return nil, zero, rpcErr
 	}
-	server.mu.Lock()
-	session := server.sessions[sessionID]
-	server.mu.Unlock()
-	if session == nil {
-		return nil, zero, &respError{Code: -32602, Message: "unknown gdb session"}
+	session, rpcErr := server.lookupSession(sessionID)
+	if rpcErr != nil {
+		return nil, zero, rpcErr
 	}
 	var request T
 	if err := json.Unmarshal(params[1], &request); err != nil {
@@ -1330,23 +1320,9 @@ func selectorMatches(input []byte, selector []byte) bool {
 }
 
 func rangesOverlap(offsetA uint64, sizeA uint64, offsetB uint64, sizeB uint64) bool {
-	endA := offsetA + maxUint64(sizeA, 1)
-	endB := offsetB + maxUint64(sizeB, 1)
+	endA := offsetA + max(sizeA, uint64(1))
+	endB := offsetB + max(sizeB, uint64(1))
 	return offsetA < endB && offsetB < endA
-}
-
-func maxUint64(a uint64, b uint64) uint64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func maxInt(a int, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func hookTypeLabel(hookType engine.HookType) string {

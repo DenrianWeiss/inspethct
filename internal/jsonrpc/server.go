@@ -91,11 +91,21 @@ type callArgs struct {
 }
 
 func NewServer(engineRef *forkengine.Engine) *Server {
-	return &Server{engine: engineRef, sessions: make(map[string]*ReplaySession), patches: make(map[string]*StatePatch), sequences: make(map[string]*SequenceSession), mode: serverModeFull}
+	return newServer(engineRef, serverModeFull)
 }
 
 func NewGDBServer(engineRef *forkengine.Engine) *Server {
-	return &Server{engine: engineRef, sessions: make(map[string]*ReplaySession), patches: make(map[string]*StatePatch), sequences: make(map[string]*SequenceSession), mode: serverModeGDBOnly}
+	return newServer(engineRef, serverModeGDBOnly)
+}
+
+func newServer(engineRef *forkengine.Engine, mode serverMode) *Server {
+	return &Server{
+		engine:    engineRef,
+		sessions:  make(map[string]*ReplaySession),
+		patches:   make(map[string]*StatePatch),
+		sequences: make(map[string]*SequenceSession),
+		mode:      mode,
+	}
 }
 
 func (server *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -244,42 +254,53 @@ func (server *Server) handle(ctx context.Context, req request) (any, *respError)
 	}
 }
 
+// gdbMethodNames lists the gdb.* method surface advertised via
+// dbgserver.capabilities and accepted in gdb-only mode. Single source of truth
+// to keep methodAllowed and capabilities() in sync.
+var gdbMethodNames = []string{
+	"gdb.startReplaySession",
+	"gdb.startCallSession",
+	"gdb.next",
+	"gdb.continue",
+	"gdb.state",
+	"gdb.loadSourceBundle",
+	"gdb.setSourceBreakpoint",
+	"gdb.setFunctionBreakpoint",
+	"gdb.setCallBreakpoint",
+	"gdb.setStorageBreakpoint",
+	"gdb.setMemoryBreakpoint",
+	"gdb.listBreakpoints",
+	"gdb.deleteBreakpoint",
+	"gdb.writeStorage",
+	"gdb.writeMemory",
+	"gdb.exportStatePatch",
+	"gdb.importStatePatch",
+	"gdb.startSequenceSession",
+	"gdb.nextStepSession",
+}
+
+var gdbAllowedMethods = func() map[string]struct{} {
+	allowed := make(map[string]struct{}, len(gdbMethodNames)+2)
+	allowed["dbgserver.capabilities"] = struct{}{}
+	allowed["eth_chainId"] = struct{}{}
+	for _, name := range gdbMethodNames {
+		allowed[name] = struct{}{}
+	}
+	return allowed
+}()
+
 func (server *Server) methodAllowed(method string) bool {
 	if server.mode != serverModeGDBOnly {
 		return true
 	}
-	switch method {
-	case "dbgserver.capabilities", "eth_chainId", "gdb.startReplaySession", "gdb.startCallSession", "gdb.next", "gdb.continue", "gdb.state", "gdb.loadSourceBundle", "gdb.setSourceBreakpoint", "gdb.setFunctionBreakpoint", "gdb.setCallBreakpoint", "gdb.setStorageBreakpoint", "gdb.setMemoryBreakpoint", "gdb.listBreakpoints", "gdb.deleteBreakpoint", "gdb.writeStorage", "gdb.writeMemory", "gdb.exportStatePatch", "gdb.importStatePatch", "gdb.startSequenceSession", "gdb.nextStepSession":
-		return true
-	default:
-		return false
-	}
+	_, ok := gdbAllowedMethods[method]
+	return ok
 }
 
 func (server *Server) capabilities() map[string]any {
 	return map[string]any{
-		"mode": server.mode,
-		"methods": []string{
-			"gdb.startReplaySession",
-			"gdb.startCallSession",
-			"gdb.next",
-			"gdb.continue",
-			"gdb.state",
-			"gdb.loadSourceBundle",
-			"gdb.setSourceBreakpoint",
-			"gdb.setFunctionBreakpoint",
-			"gdb.setCallBreakpoint",
-			"gdb.setStorageBreakpoint",
-			"gdb.setMemoryBreakpoint",
-			"gdb.listBreakpoints",
-			"gdb.deleteBreakpoint",
-			"gdb.writeStorage",
-			"gdb.writeMemory",
-			"gdb.exportStatePatch",
-			"gdb.importStatePatch",
-			"gdb.startSequenceSession",
-			"gdb.nextStepSession",
-		},
+		"mode":    server.mode,
+		"methods": gdbMethodNames,
 		"features": map[string]any{
 			"statePatch":      true,
 			"sequenceSession": true,
@@ -329,7 +350,7 @@ func (server *Server) startReplaySession(ctx context.Context, txHash engine.Hash
 	if len(replay.LocalTrace) == 0 {
 		return server.describeSession(session), nil
 	}
-	if _, rpcErr := server.advanceSessionWithContext(ctx, session, false); rpcErr != nil {
+	if _, rpcErr := server.advanceLoadedSession(ctx, session, false); rpcErr != nil {
 		return nil, rpcErr
 	}
 	return server.describeSession(session), nil
@@ -360,37 +381,23 @@ func (server *Server) startCallSession(ctx context.Context, params []json.RawMes
 }
 
 func (server *Server) advanceSession(sessionID string, all bool) (any, *respError) {
-	return server.advanceSessionWithContext(context.Background(), nil, allSessionRequest{sessionID: sessionID, all: all})
-}
-
-type allSessionRequest struct {
-	sessionID string
-	all       bool
-}
-
-func (server *Server) advanceSessionWithContext(ctx context.Context, sessionRef any, request any) (any, *respError) {
-	var session *ReplaySession
-	switch typed := sessionRef.(type) {
-	case *ReplaySession:
-		session = typed
-	case nil:
-		server.mu.Lock()
-		req := request.(allSessionRequest)
-		var ok bool
-		session, ok = server.sessions[req.sessionID]
-		server.mu.Unlock()
-		if !ok {
-			return nil, &respError{Code: -32602, Message: "unknown gdb session"}
-		}
-	default:
-		return nil, &respError{Code: -32603, Message: "invalid session request"}
+	server.mu.Lock()
+	session, ok := server.sessions[sessionID]
+	server.mu.Unlock()
+	if !ok {
+		return nil, &respError{Code: -32602, Message: "unknown gdb session"}
 	}
+	return server.advanceLoadedSession(context.Background(), session, all)
+}
+
+// advanceLoadedSession runs (or steps) the given session and returns its
+// described state.
+func (server *Server) advanceLoadedSession(ctx context.Context, session *ReplaySession, all bool) (any, *respError) {
 	if session.Kind != "call" && len(session.Trace) == 0 {
 		session.Done = true
 		return server.describeSession(session), nil
 	}
-	req, _ := request.(allSessionRequest)
-	if rpcErr := server.replaySession(ctx, session, req.all); rpcErr != nil {
+	if rpcErr := server.replaySession(ctx, session, all); rpcErr != nil {
 		return nil, rpcErr
 	}
 	return server.describeSession(session), nil
@@ -467,7 +474,7 @@ func decodeEthCall(params []json.RawMessage) (ext.EthCallRequest, *respError) {
 	if err != nil {
 		return ext.EthCallRequest{}, &respError{Code: -32602, Message: err.Error()}
 	}
-	input, err := decodeBytes(firstNonEmpty(args.Input, args.Data))
+	input, err := decodeBytes(cmpOrString(args.Input, args.Data))
 	if err != nil {
 		return ext.EthCallRequest{}, &respError{Code: -32602, Message: err.Error()}
 	}
@@ -677,7 +684,7 @@ func internalError(err error) *respError {
 	return &respError{Code: -32000, Message: err.Error()}
 }
 
-func firstNonEmpty(left, right string) string {
+func cmpOrString(left, right string) string {
 	if strings.TrimSpace(left) != "" {
 		return left
 	}

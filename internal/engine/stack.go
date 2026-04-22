@@ -1,64 +1,49 @@
 package engine
 
-import (
-	"sync"
-)
-
 const maxStackSize = 1024
 
 // EVMStack implements the Stack interface with a 1024-item limit.
+//
+// EVM execution is single-threaded per call frame, so the stack does not
+// require synchronization. The previous implementation guarded every push/pop
+// with a sync.RWMutex which dominated interpreter overhead.
 type EVMStack struct {
-	mu    sync.RWMutex
-	data  []Word
-	limit int
+	data []Word
 }
 
 // NewStack creates a new EVM stack.
 func NewStack() *EVMStack {
-	return &EVMStack{
-		data:  make([]Word, 0, 64),
-		limit: maxStackSize,
-	}
+	return &EVMStack{data: make([]Word, 0, 64)}
 }
 
-func (s *EVMStack) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.data)
-}
+func (s *EVMStack) Len() int { return len(s.data) }
 
 func (s *EVMStack) Push(word Word) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.data) >= s.limit {
+	if len(s.data) >= maxStackSize {
 		panic(ErrStackOverflow)
 	}
 	s.data = append(s.data, word)
 }
 
 func (s *EVMStack) Pop() Word {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.data) == 0 {
+	n := len(s.data)
+	if n == 0 {
 		panic(ErrStackUnderflow)
 	}
-	word := s.data[len(s.data)-1]
-	s.data = s.data[:len(s.data)-1]
+	word := s.data[n-1]
+	s.data = s.data[:n-1]
 	return word
 }
 
 func (s *EVMStack) Peek() Word {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.data) == 0 {
+	n := len(s.data)
+	if n == 0 {
 		panic(ErrStackUnderflow)
 	}
-	return s.data[len(s.data)-1]
+	return s.data[n-1]
 }
 
 func (s *EVMStack) PeekN(n int) Word {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if n < 0 || n >= len(s.data) {
 		panic(ErrStackUnderflow)
 	}
@@ -66,8 +51,6 @@ func (s *EVMStack) PeekN(n int) Word {
 }
 
 func (s *EVMStack) Swap(n int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if n < 1 || n >= len(s.data) {
 		panic(ErrStackUnderflow)
 	}
@@ -77,18 +60,16 @@ func (s *EVMStack) Swap(n int) {
 }
 
 func (s *EVMStack) Dup(n int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if n < 1 || n > len(s.data) {
 		panic(ErrStackUnderflow)
 	}
-	if len(s.data) >= s.limit {
+	if len(s.data) >= maxStackSize {
 		panic(ErrStackOverflow)
 	}
 	s.data = append(s.data, s.data[len(s.data)-n])
 }
 
-// PopUint256 pops a word and returns it as a big.Int.
+// PopBig pops a word and returns a pointer to it.
 func (s *EVMStack) PopBig() *Word {
 	w := s.Pop()
 	return &w
@@ -96,8 +77,6 @@ func (s *EVMStack) PopBig() *Word {
 
 // Require ensures the stack has at least n items.
 func (s *EVMStack) Require(n int) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if len(s.data) < n {
 		return ErrStackUnderflow
 	}
@@ -106,8 +85,6 @@ func (s *EVMStack) Require(n int) error {
 
 // Data returns a copy of the stack contents (for tracing).
 func (s *EVMStack) Data() []Word {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	out := make([]Word, len(s.data))
 	copy(out, s.data)
 	return out

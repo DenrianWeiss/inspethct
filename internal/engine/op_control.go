@@ -4,7 +4,7 @@ import "math/big"
 
 func opJump(evm *EVM) error {
 	dest := wordToUint64(evm.stack.Pop())
-	if !evm.jumpdests[dest] {
+	if !evm.isJumpdest(dest) {
 		return ErrInvalidJump
 	}
 	evm.pc = dest
@@ -15,7 +15,7 @@ func opJumpi(evm *EVM) error {
 	dest := wordToUint64(evm.stack.Pop())
 	cond := evm.stack.Pop().ToBig()
 	if cond.Sign() != 0 {
-		if !evm.jumpdests[dest] {
+		if !evm.isJumpdest(dest) {
 			return ErrInvalidJump
 		}
 		evm.pc = dest

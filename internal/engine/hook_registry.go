@@ -55,8 +55,12 @@ func (r *SimpleHookRegistry) Unregister(hookID string) error {
 func (r *SimpleHookRegistry) HooksFor(hookType HookType) []Hook {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]Hook, len(r.byType[hookType]))
-	copy(out, r.byType[hookType])
+	hooks := r.byType[hookType]
+	if len(hooks) == 0 {
+		return nil
+	}
+	out := make([]Hook, len(hooks))
+	copy(out, hooks)
 	return out
 }
 

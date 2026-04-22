@@ -631,11 +631,7 @@ func (engineRef *Engine) reconstructPriorTransactions(ctx context.Context, execu
 			replayState.Limitation = fmt.Sprintf("failed to execute prior transaction %x: %v", transaction.Hash, execErr)
 			return nil
 		}
-		if commitErr := engineRef.CommitLocalWrites(prepared, result); commitErr != nil {
-			replayState.Exact = false
-			replayState.Limitation = fmt.Sprintf("failed to commit prior transaction %x: %v", transaction.Hash, commitErr)
-			return nil
-		}
+		engineRef.commitReplayReconstructionWrites(prepared, result)
 		comparison := CompareReplayToReceipt(transaction, receipt, result)
 		if !comparison.Match {
 			replayState.Exact = false
@@ -652,6 +648,61 @@ func (engineRef *Engine) reconstructPriorTransactions(ctx context.Context, execu
 	replayState.StateBlockRef = syntheticStateRef
 	replayState.AppliedPriorTransactions = applied
 	return nil
+}
+
+// commitReplayReconstructionWrites applies prior-transaction writes to the
+// synthetic replay state unconditionally. Replay reconstruction must always
+// carry forward local writes between earlier transactions, independent of the
+// global cache policy used for normal call/replay entry points.
+func (engineRef *Engine) commitReplayReconstructionWrites(prepared *PreparedCall, result *engine.ExecutionResult) {
+	if prepared == nil {
+		return
+	}
+	engineRef.writeBackPreparedState(prepared)
+	if prepared.Create && prepared.Target != nil && result != nil && result.Status == engine.StatusSuccess {
+		createDiff := &engine.StateDiff{
+			CodeChanges:     map[engine.Address][]byte{*prepared.Target: append([]byte(nil), result.ReturnData...)},
+			CreatedAccounts: []engine.Address{*prepared.Target},
+		}
+		engineRef.cache.ApplyStateDiff(prepared.StateBlockRef, createDiff)
+	}
+	engineRef.cache.ApplyOverlay(prepared.StateBlockRef, prepared.Overlay)
+	if result != nil {
+		engineRef.cache.ApplyStateDiff(prepared.StateBlockRef, result.StateChanges)
+	}
+}
+
+func (engineRef *Engine) writeBackPreparedState(prepared *PreparedCall) {
+	if prepared == nil {
+		return
+	}
+	if accountState, ok := prepared.Config.State.(*forkAccountState); ok && accountState != nil {
+		for addr := range accountState.loaded {
+			snapshot := upstream.AccountSnapshot{
+				Balance: cloneBigInt(accountState.base.Balance(addr)),
+				Nonce:   accountState.base.Nonce(addr),
+				Code:    cloneBytes(accountState.base.Code(addr)),
+				CodeHash: func() engine.Hash {
+					if code := accountState.base.Code(addr); len(code) > 0 {
+						return hashBytes(code)
+					}
+					return accountState.base.CodeHash(addr)
+				}(),
+				Exists: accountState.base.Exists(addr),
+			}
+			engineRef.cache.PutAccount(addr, prepared.StateBlockRef, snapshot)
+			if len(snapshot.Code) > 0 {
+				engineRef.cache.PutCode(addr, prepared.StateBlockRef, snapshot.Code)
+			}
+		}
+	}
+	if storageState, ok := prepared.Config.Storage.(*forkStorage); ok && storageState != nil {
+		for addr, slots := range storageState.loaded {
+			for slot := range slots {
+				engineRef.cache.PutStorage(addr, slot, prepared.StateBlockRef, storageState.base.Get(addr, slot))
+			}
+		}
+	}
 }
 
 func (engineRef *Engine) prepareReplayTransactionWithState(ctx context.Context, tx upstream.Transaction, receipt upstream.Receipt, executionBlockRef upstream.BlockRef, stateView preparedStateView, replayState *ReplayState) (*PreparedCall, error) {
