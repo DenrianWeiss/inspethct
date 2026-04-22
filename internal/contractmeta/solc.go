@@ -51,8 +51,8 @@ type solcCompilerMessage struct {
 // The cache location is (first match wins):
 //  1. INSPETHCT_SOLC_CACHE environment variable
 //  2. OS user cache: ~/.cache/inspethct/solc (Linux)
-//                    ~/Library/Caches/inspethct/solc (macOS)
-//                    %LocalAppData%\inspethct\solc (Windows)
+//     ~/Library/Caches/inspethct/solc (macOS)
+//     %LocalAppData%\inspethct\solc (Windows)
 //
 // Binaries are stored under <cacheDir>/<platform>/<filename> so multiple
 // target platforms can coexist without conflicts.

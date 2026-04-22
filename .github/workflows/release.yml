@@ -1,0 +1,186 @@
+name: Release
+
+# Trigger on version tags (e.g. v0.1.0) or manual dispatch.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0). Used for artifact naming when run manually."
+        required: false
+        default: "dev"
+
+# One concurrent release at a time.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 1: Backend tests (fast gate before building artifacts)
+  # ──────────────────────────────────────────────────────────────────────────
+  test:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run full test suite
+        run: go test -count=1 ./...
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 2: Cross-compile inspethctd for all platforms
+  # ──────────────────────────────────────────────────────────────────────────
+  build-binaries:
+    name: Build binary (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            artifact: inspethctd-linux-amd64
+          - goos: linux
+            goarch: arm64
+            artifact: inspethctd-linux-arm64
+          - goos: darwin
+            goarch: amd64
+            artifact: inspethctd-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            artifact: inspethctd-darwin-arm64
+          - goos: windows
+            goarch: amd64
+            artifact: inspethctd-windows-amd64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.inputs.tag || 'dev' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p bin
+          go build \
+            -ldflags "-s -w -X main.version=${{ steps.version.outputs.value }}" \
+            -o bin/${{ matrix.artifact }} \
+            ./cmd/inspethctd
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: bin/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 3: Package the VS Code extension as a .vsix
+  # ──────────────────────────────────────────────────────────────────────────
+  build-vsix:
+    name: Build VSIX
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: plugin/package-lock.json
+
+      - name: Compute version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.inputs.tag || 'dev' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        working-directory: plugin
+        run: npm ci
+
+      - name: Compile TypeScript
+        working-directory: plugin
+        run: npm run compile
+
+      - name: Package VSIX
+        working-directory: plugin
+        run: |
+          VERSION_CLEAN="${{ steps.version.outputs.value }}"
+          VERSION_CLEAN="${VERSION_CLEAN#v}"   # strip leading 'v' for semver
+          npx vsce package \
+            --out "../bin/inspethct-${VERSION_CLEAN}.vsix" \
+            --no-git-tag-version \
+            --no-update-package-json
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspethct-vsix
+          path: bin/*.vsix
+          if-no-files-found: error
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Job 4: Create GitHub Release and attach all artifacts
+  # ──────────────────────────────────────────────────────────────────────────
+  release:
+    name: Publish release
+    # Only publish a real release on tag pushes; skip on workflow_dispatch.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-binaries, build-vsix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the release
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh release-artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Inspethct ${{ github.ref_name }}"
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-artifacts/*

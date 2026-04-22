@@ -26,3 +26,4 @@
 # ...even if they are in subdirectories
 !*/
 !docs/*.md
+!.github/workflows/*.yml
