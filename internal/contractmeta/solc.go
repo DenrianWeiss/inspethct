@@ -1,6 +1,7 @@
 package contractmeta
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -46,36 +47,74 @@ type solcCompilerMessage struct {
 	Message          string `json:"message"`
 }
 
-// NewSolcManager constructs a solc downloader using the user's cache directory.
+// NewSolcManager constructs a SolcManager using the global user-level cache.
+// The cache location is (first match wins):
+//  1. INSPETHCT_SOLC_CACHE environment variable
+//  2. OS user cache: ~/.cache/inspethct/solc (Linux)
+//                    ~/Library/Caches/inspethct/solc (macOS)
+//                    %LocalAppData%\inspethct\solc (Windows)
+//
+// Binaries are stored under <cacheDir>/<platform>/<filename> so multiple
+// target platforms can coexist without conflicts.
 func NewSolcManager() (*SolcManager, error) {
-	workDir, err := os.Getwd()
+	cacheDir, err := globalSolcCacheDir()
 	if err != nil {
 		return nil, err
 	}
-	cacheDir := solcCacheDirFor(workDir)
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, err
 	}
 	return &SolcManager{CacheDir: cacheDir, BaseURL: solcBinariesBaseURL, Client: http.DefaultClient}, nil
 }
 
-// EnsureVersion downloads the requested solc version into the cache if needed.
+// globalSolcCacheDir returns the user-level cache directory for solc binaries.
+// It honours INSPETHCT_SOLC_CACHE for explicit overrides (CI / Docker).
+func globalSolcCacheDir() (string, error) {
+	if override := os.Getenv("INSPETHCT_SOLC_CACHE"); strings.TrimSpace(override) != "" {
+		return override, nil
+	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine user cache directory: %w", err)
+	}
+	return filepath.Join(base, "inspethct", "solc"), nil
+}
+
+// EnsureVersion downloads the requested solc version for the current runtime
+// platform into the global cache if not already present.
+// Returns the path to the cached binary.
 func (manager *SolcManager) EnsureVersion(ctx context.Context, compilerVersion string) (string, error) {
+	return manager.EnsureVersionForPlatform(ctx, compilerVersion, runtime.GOOS, runtime.GOARCH)
+}
+
+// EnsureVersionForPlatform downloads the requested solc version for the
+// specified GOOS/GOARCH target into the global cache if not already present.
+// This allows pre-populating the cache for platforms other than the running
+// host (useful in CI release pipelines that need binaries for multiple OSes).
+// Returns the path to the cached binary.
+func (manager *SolcManager) EnsureVersionForPlatform(ctx context.Context, compilerVersion, goos, goarch string) (string, error) {
 	if manager == nil {
 		return "", fmt.Errorf("solc manager is nil")
 	}
-	build, err := manager.lookupBuild(ctx, compilerVersion)
+	platform := platformDirectoryFor(goos, goarch)
+	build, err := manager.lookupBuildForPlatform(ctx, compilerVersion, platform)
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(manager.CacheDir, build.Path)
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
+
+	// Windows binaries ≥ 0.7.2 are .exe; older builds are .zip archives
+	// containing a single .exe.  Normalise to the executable path so the
+	// cache key is always the final binary, not the archive.
+	// Store at <cacheDir>/<platform>/<filename>
+	binaryPath := filepath.Join(manager.CacheDir, platform, solcBinaryName(build.Path))
+	if _, statErr := os.Stat(binaryPath); statErr == nil {
+		return binaryPath, nil // already cached
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(binaryPath), 0o755); err != nil {
 		return "", err
 	}
-	url := strings.TrimRight(manager.BaseURL, "/") + "/" + platformDirectory() + "/" + build.Path
+
+	url := strings.TrimRight(manager.BaseURL, "/") + "/" + platform + "/" + build.Path
 	request, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", err
@@ -86,17 +125,89 @@ func (manager *SolcManager) EnsureVersion(ctx context.Context, compilerVersion s
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download solc %s: unexpected status %s", compilerVersion, response.Status)
+		return "", fmt.Errorf("download solc %s for %s/%s: unexpected status %s",
+			compilerVersion, goos, goarch, response.Status)
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+
+	// Write to a temp file first to avoid leaving a partial binary if interrupted.
+	tmp, err := os.CreateTemp(filepath.Dir(binaryPath), ".solc-download-*")
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
-	if _, err := io.Copy(file, response.Body); err != nil {
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()
+		_ = os.Remove(tmpName) // no-op if rename succeeded
+	}()
+	if _, err := io.Copy(tmp, response.Body); err != nil {
 		return "", err
 	}
-	return path, nil
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+
+	// For zip archives (older Windows builds), extract the inner executable.
+	readyName := tmpName
+	if strings.HasSuffix(build.Path, ".zip") {
+		extracted, err := extractSolcZip(tmpName, filepath.Dir(binaryPath))
+		if err != nil {
+			return "", fmt.Errorf("extract solc zip for %s: %w", build.Path, err)
+		}
+		_ = os.Remove(tmpName)
+		readyName = extracted
+	}
+	if err := os.Chmod(readyName, 0o755); err != nil {
+		_ = os.Remove(readyName)
+		return "", err
+	}
+	if err := os.Rename(readyName, binaryPath); err != nil {
+		_ = os.Remove(readyName)
+		return "", err
+	}
+	return binaryPath, nil
+}
+
+// solcBinaryName returns the canonical on-disk name for a solc build path.
+// For zip archives (older Windows builds) the stored name uses .exe instead
+// of .zip so the cache always points to a directly executable file.
+func solcBinaryName(buildPath string) string {
+	if strings.HasSuffix(buildPath, ".zip") {
+		return buildPath[:len(buildPath)-4] + ".exe"
+	}
+	return buildPath
+}
+
+// extractSolcZip extracts the first non-directory entry from the zip file at
+// srcPath into a new temp file in dir and returns the temp file path.
+func extractSolcZip(srcPath, dir string) (string, error) {
+	zr, err := zip.OpenReader(srcPath)
+	if err != nil {
+		return "", err
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return "", err
+		}
+		out, err := os.CreateTemp(dir, ".solc-extract-*")
+		if err != nil {
+			rc.Close()
+			return "", err
+		}
+		_, copyErr := io.Copy(out, rc)
+		rc.Close()
+		out.Close()
+		if copyErr != nil {
+			_ = os.Remove(out.Name())
+			return "", copyErr
+		}
+		return out.Name(), nil
+	}
+	return "", fmt.Errorf("no file entry found in zip")
 }
 
 // CompileStandardInput compiles Solidity standard-json input via a cached solc binary.
@@ -128,8 +239,9 @@ func InspectBundleMetadata(bundle *Bundle) srcmap.ContractMetadata {
 	return bundle.Metadata
 }
 
-func (manager *SolcManager) lookupBuild(ctx context.Context, compilerVersion string) (*solcBuild, error) {
-	request, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(manager.BaseURL, "/")+"/"+platformDirectory()+"/list.json", nil)
+func (manager *SolcManager) lookupBuildForPlatform(ctx context.Context, compilerVersion, platform string) (*solcBuild, error) {
+	url := strings.TrimRight(manager.BaseURL, "/") + "/" + platform + "/list.json"
+	request, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +251,7 @@ func (manager *SolcManager) lookupBuild(ctx context.Context, compilerVersion str
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("load solc version list: unexpected status %s", response.Status)
+		return nil, fmt.Errorf("load solc version list for %s: unexpected status %s", platform, response.Status)
 	}
 	var list solcList
 	if err := json.NewDecoder(response.Body).Decode(&list); err != nil {
@@ -155,11 +267,12 @@ func (manager *SolcManager) lookupBuild(ctx context.Context, compilerVersion str
 		return &solcBuild{Path: path, Version: normalized.Short, LongVersion: normalized.Full}, nil
 	}
 	for _, build := range list.Builds {
-		if normalizeCompilerVersion(build.LongVersion).Full == normalized.Full || normalizeCompilerVersion(build.Version).Short == normalized.Short {
+		if normalizeCompilerVersion(build.LongVersion).Full == normalized.Full ||
+			normalizeCompilerVersion(build.Version).Short == normalized.Short {
 			return &build, nil
 		}
 	}
-	return nil, fmt.Errorf("solc version %q is not available for %s", compilerVersion, platformDirectory())
+	return nil, fmt.Errorf("solc version %q is not available for %s", compilerVersion, platform)
 }
 
 func (manager *SolcManager) httpClient() *http.Client {
@@ -202,8 +315,23 @@ func platformDirectoryFor(goos string, goarch string) string {
 	}
 }
 
-func solcCacheDirFor(workDir string) string {
-	return filepath.Join(workDir, ".inspethct", "solc")
+// CachedPlatforms returns the list of platform directories that have at least
+// one solc binary already cached under CacheDir.
+func (manager *SolcManager) CachedPlatforms() ([]string, error) {
+	entries, err := os.ReadDir(manager.CacheDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	platforms := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			platforms = append(platforms, entry.Name())
+		}
+	}
+	return platforms, nil
 }
 
 func compilerOutputError(output []byte) error {
