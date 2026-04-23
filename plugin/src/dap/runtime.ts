@@ -176,6 +176,8 @@ export class InspethctRuntime {
       this.sessionId = this.lastState.id;
     }
 
+    await this.configureAutoMatch();
+
     if (this.launch.sourceBundle) {
       await this.loadSourceBundle(this.launch.sourceBundle, "initial");
     }
@@ -477,6 +479,30 @@ export class InspethctRuntime {
       } else {
         this.notifier?.warn(`Source bundle load failed: ${message}`);
       }
+    }
+  }
+
+  private async configureAutoMatch(): Promise<void> {
+    if (!this.rpc || !this.sessionId) {
+      return;
+    }
+    const cfg = this.launch as InspethctLaunchConfig & { workspaceRoot?: string; explorerFallbackEnabled?: boolean };
+    const projectRoot = cfg.workspaceRoot ?? "";
+    const baseBundle = this.launch.sourceBundle;
+    try {
+      await this.rpc.call("gdb.configureAutoMatch", [
+        this.sessionId,
+        {
+          projectRoot,
+          explorerEnabled: cfg.explorerFallbackEnabled === true,
+          apiBase: baseBundle?.apiBase ?? "",
+          apiKey: baseBundle?.apiKey ?? "",
+          rpcUrl: this.launch.upstream ?? "",
+          chainId: baseBundle?.chainId ?? "1"
+        }
+      ]);
+    } catch {
+      // Best-effort configuration; keep debugging flow working even when unavailable.
     }
   }
 

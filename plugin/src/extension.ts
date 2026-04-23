@@ -93,6 +93,10 @@ class InspethctConfigurationProvider implements vscode.DebugConfigurationProvide
     }
 
     config.autoSourceBundle = config.autoSourceBundle ?? true;
+    if (config.explorerFallbackEnabled === undefined) {
+      const settings = vscode.workspace.getConfiguration("inspethct", folder?.uri);
+      config.explorerFallbackEnabled = settings.get<boolean>("explorerFallbackEnabled", false);
+    }
     if (!config.sourceBundle && config.autoSourceBundle) {
       config.sourceBundle = buildAutoSourceBundle(folder);
     }

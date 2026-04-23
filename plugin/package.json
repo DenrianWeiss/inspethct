@@ -146,6 +146,11 @@
                 "default": true,
                 "description": "Auto-detect source bundle from local artifacts or block explorer."
               },
+              "explorerFallbackEnabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Enable explorer fallback for auto-matching call-stack contracts."
+              },
               "carryUserMutations": {
                 "type": "boolean",
                 "default": true
@@ -282,6 +287,11 @@
           "type": "string",
           "default": "1",
           "description": "Chain ID passed to the explorer (1 = Ethereum mainnet)."
+        },
+        "inspethct.explorerFallbackEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable explorer fallback for auto-matching call-stack contracts."
         }
       }
     }

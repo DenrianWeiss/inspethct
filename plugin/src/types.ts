@@ -62,6 +62,7 @@ export interface InspethctLaunchConfig {
   sourceBundle?: SourceBundleConfig;
   promptSourceBundle?: boolean;
   autoSourceBundle?: boolean;
+  explorerFallbackEnabled?: boolean;
   carryUserMutations?: boolean;
 }
 

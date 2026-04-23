@@ -57,6 +57,18 @@ type CallFrameInfo struct {
 	CallType        string `json:"callType,omitempty"` // "root" | "call" | "delegatecall" | "staticcall" | "callcode" | "create"
 	Selector        string `json:"selector,omitempty"`
 	InputSize       int    `json:"inputSize"`
+	// ContractName is resolved from the loaded source bundle for CodeAddress.
+	ContractName string `json:"contractName,omitempty"`
+	// FunctionSignature is the canonical "name(types)" form of the called
+	// function, resolved (in priority order) from: the bundle ABI, the
+	// session-level OpenChain lookup cache, or left empty when neither
+	// source nor signature database can identify the selector.
+	FunctionSignature string `json:"functionSignature,omitempty"`
+	// FunctionName is the bare function name (no parameter list).
+	FunctionName string `json:"functionName,omitempty"`
+	// FunctionSource indicates where FunctionSignature came from: "abi",
+	// "openchain", or empty when unresolved.
+	FunctionSource string `json:"functionSource,omitempty"`
 }
 
 // MemoryRegionInfo describes a contiguous range of EVM memory with a
@@ -282,6 +294,19 @@ func (server *Server) replaySession(ctx context.Context, session *ReplaySession,
 	_ = debugHooks.Register(newStorageHook(session, engine.HookTypeStorageWrite, engine.HookTypeTransientStore, "jsonrpc-storage-write", true))
 	_ = debugHooks.Register(newMemoryHook(session, engine.HookTypeMemoryRead, "jsonrpc-memory-read", false))
 	_ = debugHooks.Register(newMemoryHook(session, engine.HookTypeMemoryWrite, "jsonrpc-memory-write", true))
+	for i, ht := range []engine.HookType{
+		engine.HookTypeExternalCall,
+		engine.HookTypeDelegateCall,
+		engine.HookTypeStaticCall,
+		engine.HookTypeCallCode,
+	} {
+		_ = debugHooks.Register(&contractPreloadHook{
+			server:   server,
+			session:  session,
+			hookType: ht,
+			hookID:   fmt.Sprintf("auto-match-%d", i),
+		})
+	}
 	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, debugHooks)
 	result, execErr := server.engine.ExecutePreparedCall(prepared)
 	if execErr != nil && !errors.Is(execErr, errReplayPause) && result == nil {
@@ -1407,6 +1432,7 @@ func (server *Server) loadSourceBundle(ctx context.Context, params []json.RawMes
 	if bundle.Address != nil {
 		session.TargetAddr = bundle.Address
 	}
+	resyncBreakpointsForBundle(session, bundle)
 	described := server.describeSession(session)
 	if sourceLabel != "" {
 		described["bundleSource"] = sourceLabel
@@ -1477,14 +1503,51 @@ func (server *Server) setSourceBreakpoint(params []json.RawMessage) (any, *respE
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	bundle, codeAddress, rpcErr := resolveBundleForBreakpoint(session, request.Address)
-	if rpcErr != nil {
-		return nil, rpcErr
+	if strings.TrimSpace(request.SourceName) == "" {
+		return nil, &respError{Code: -32602, Message: "sourceName is required"}
 	}
-	pcs, rpcErr := resolveSourceBreakpointPCs(bundle, request.SourceName, request.Line, request.Column)
-	if rpcErr != nil {
-		return nil, rpcErr
+	if request.Line <= 0 {
+		return nil, &respError{Code: -32602, Message: "line must be >= 1"}
 	}
+
+	var (
+		pcs         []uint64
+		codeAddress string
+	)
+	// If an address is explicitly requested, resolve against that bundle only.
+	if strings.TrimSpace(request.Address) != "" {
+		bundle, addr, bundleErr := resolveBundleForBreakpoint(session, request.Address)
+		if bundleErr != nil {
+			return nil, bundleErr
+		}
+		resolved, resErr := resolveSourceBreakpointPCs(bundle, request.SourceName, request.Line, request.Column)
+		if resErr != nil {
+			return nil, resErr
+		}
+		pcs = resolved
+		codeAddress = addr
+	} else {
+		// Search every loaded bundle for one that contains this source. The
+		// breakpoint is stored as pending (no PCs) when no match is found so
+		// that resyncBreakpointsForBundle can resolve it after the relevant
+		// contract gets auto-loaded at runtime.
+		for key, bundle := range session.Bundles {
+			if bundle == nil || bundle.Index == nil {
+				continue
+			}
+			if _, ok := bundle.Index.SourceFileByName(request.SourceName); !ok {
+				continue
+			}
+			resolved, resErr := resolveSourceBreakpointPCs(bundle, request.SourceName, request.Line, request.Column)
+			if resErr != nil || len(resolved) == 0 {
+				continue
+			}
+			pcs = resolved
+			codeAddress = key
+			break
+		}
+	}
+
 	id := request.ID
 	if id == "" {
 		id = fmt.Sprintf("bp-source-%s-%d-%d", request.SourceName, request.Line, request.Column)
@@ -2332,4 +2395,120 @@ func (registry *mergedHookRegistry) Clear() {
 	for _, child := range registry.registries {
 		child.Clear()
 	}
+}
+
+// contractPreloadHook fires on CALL/DELEGATECALL/STATICCALL/CALLCODE opcodes and
+// attempts to auto-match the callee contract's source bundle using AutoMatchBundle.
+// It is a no-op when session.AutoMatchCfg is nil.
+type contractPreloadHook struct {
+	server   *Server
+	session  *ReplaySession
+	hookType engine.HookType
+	hookID   string
+}
+
+func (h *contractPreloadHook) Type() engine.HookType { return h.hookType }
+func (h *contractPreloadHook) OneTime() bool          { return false }
+func (h *contractPreloadHook) ID() string             { return h.hookID }
+
+func (h *contractPreloadHook) Fire(ctx *engine.HookContext) (*engine.HookResult, error) {
+	if h.session.AutoMatchCfg == nil || ctx == nil || ctx.Call == nil {
+		return &engine.HookResult{Action: engine.ActionContinue}, nil
+	}
+	callee := ctx.Call.Callee
+	codeAddr := ctx.Call.CodeAddr
+	calleeKey := addressHex(callee)
+	codeKey := addressHex(codeAddr)
+	if h.session.matchedAddresses == nil {
+		h.session.matchedAddresses = make(map[string]struct{})
+	}
+	if _, seen := h.session.matchedAddresses[calleeKey]; seen {
+		return &engine.HookResult{Action: engine.ActionContinue}, nil
+	}
+	h.session.matchedAddresses[calleeKey] = struct{}{}
+	h.session.matchedAddresses[codeKey] = struct{}{}
+	// skip if bundle already loaded for this code address
+	if h.session.Bundles != nil {
+		if _, ok := h.session.Bundles[codeKey]; ok {
+			return &engine.HookResult{Action: engine.ActionContinue}, nil
+		}
+	}
+	provider := engineAutoSourceProvider{server: h.server, session: h.session}
+	result, err := contractmeta.AutoMatchBundle(context.Background(), provider, callee, *h.session.AutoMatchCfg)
+	if err != nil || result == nil {
+		return &engine.HookResult{Action: engine.ActionContinue}, nil
+	}
+	if h.session.Bundles == nil {
+		h.session.Bundles = make(map[string]*contractmeta.Bundle)
+	}
+	key := codeKey
+	if result.Bundle.CodeAddress != nil {
+		key = addressHex(*result.Bundle.CodeAddress)
+	}
+	h.session.Bundles[key] = result.Bundle
+	resyncBreakpointsForBundle(h.session, result.Bundle)
+	return &engine.HookResult{Action: engine.ActionContinue}, nil
+}
+
+// resyncBreakpointsForBundle re-resolves source breakpoint PCs for the given
+// newly-loaded bundle. Called after a contract preload hook fires.
+func resyncBreakpointsForBundle(session *ReplaySession, bundle *contractmeta.Bundle) {
+	if bundle == nil || bundle.Index == nil {
+		return
+	}
+	codeAddrHex := ""
+	if bundle.CodeAddress != nil {
+		codeAddrHex = addressHex(*bundle.CodeAddress)
+	}
+	for i := range session.Breakpoints {
+		bp := &session.Breakpoints[i]
+		if bp.Kind != "source" || bp.SourceName == "" {
+			continue
+		}
+		pcs, rpcErr := resolveSourceBreakpointPCs(bundle, bp.SourceName, bp.Line, bp.Column)
+		if rpcErr != nil || len(pcs) == 0 {
+			continue
+		}
+		bp.PCs = pcs
+		if bp.CodeAddress == "" && codeAddrHex != "" {
+			bp.CodeAddress = codeAddrHex
+		}
+	}
+}
+
+// autoMatchConfigRequest is the JSON body for gdb.configureAutoMatch.
+type autoMatchConfigRequest struct {
+	ProjectRoot     string `json:"projectRoot"`
+	ExplorerEnabled bool   `json:"explorerEnabled"`
+	APIBase         string `json:"apiBase"`
+	APIKey          string `json:"apiKey"`
+	RPCURL          string `json:"rpcUrl"`
+	ChainID         string `json:"chainId"`
+}
+
+func (server *Server) configureAutoMatch(ctx context.Context, params []json.RawMessage) (any, *respError) {
+	session, req, rpcErr := decodeSessionAndRequest[autoMatchConfigRequest](server, params)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	mapping, _ := contractmeta.LoadDeploymentMapping(req.ProjectRoot)
+	cfg := &contractmeta.AutoMatchConfig{
+		ProjectRoot:     req.ProjectRoot,
+		CacheDir:        contractmeta.CacheDir(req.ProjectRoot),
+		Mapping:         mapping,
+		ExplorerEnabled: req.ExplorerEnabled,
+	}
+	if req.ExplorerEnabled && req.APIBase != "" && req.APIKey != "" {
+		cfg.Explorer = contractmeta.ExplorerClient{
+			APIBase: req.APIBase,
+			APIKey:  req.APIKey,
+			RPCURL:  req.RPCURL,
+			ChainID: req.ChainID,
+		}
+		if manager, err := contractmeta.NewSolcManager(); err == nil {
+			cfg.SolcManager = manager
+		}
+	}
+	session.AutoMatchCfg = cfg
+	return map[string]any{"ok": true}, nil
 }

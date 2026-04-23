@@ -66,6 +66,10 @@ type ReplaySession struct {
 	// from the root call (index 0) down to the currently executing frame.
 	// Maintained by the per-step debug hook by detecting CallDepth changes.
 	CallFrames []CallFrameInfo `json:"-"`
+	// matchedAddresses tracks addresses for which auto-matching was attempted this session.
+	matchedAddresses map[string]struct{}
+	// AutoMatchCfg is the project-level config for call-stack auto-matching.
+	AutoMatchCfg *contractmeta.AutoMatchConfig
 }
 
 type request struct {
@@ -259,6 +263,8 @@ func (server *Server) handle(ctx context.Context, req request) (any, *respError)
 		return server.startSequenceSession(ctx, req.Params)
 	case "gdb.nextStepSession":
 		return server.nextStepSession(ctx, req.Params)
+	case "gdb.configureAutoMatch":
+		return server.configureAutoMatch(ctx, req.Params)
 	default:
 		return nil, &respError{Code: -32601, Message: fmt.Sprintf("method %s not found", req.Method)}
 	}
@@ -288,6 +294,7 @@ var gdbMethodNames = []string{
 	"gdb.importStatePatch",
 	"gdb.startSequenceSession",
 	"gdb.nextStepSession",
+	"gdb.configureAutoMatch",
 }
 
 var gdbAllowedMethods = func() map[string]struct{} {
