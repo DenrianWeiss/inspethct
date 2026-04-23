@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"inspethct/internal/engine"
 	"inspethct/internal/forkengine"
@@ -223,11 +224,14 @@ func TestDBGServerRestrictsNonGDBMethods(t *testing.T) {
 	if enabled, ok := features["statePatch"].(bool); !ok || !enabled {
 		t.Fatalf("features.statePatch = %#v, want true", features["statePatch"])
 	}
+	if enabled, ok := features["livePause"].(bool); !ok || !enabled {
+		t.Fatalf("features.livePause = %#v, want true", features["livePause"])
+	}
 	methods, ok := capabilities["methods"].([]any)
 	if !ok {
 		t.Fatalf("methods missing from capabilities: %#v", capabilities)
 	}
-	if !containsAnyString(methods, "gdb.exportStatePatch") || !containsAnyString(methods, "gdb.importStatePatch") {
+	if !containsAnyString(methods, "gdb.exportStatePatch") || !containsAnyString(methods, "gdb.importStatePatch") || !containsAnyString(methods, "gdb.pause") {
 		t.Fatalf("capabilities methods missing state patch endpoints: %#v", methods)
 	}
 	errResp := rpcCallExpectError(t, server.URL, "eth_call", []any{map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": "0x0000000000000000000000000000000000000044", "input": "0x"}})
@@ -236,6 +240,52 @@ func TestDBGServerRestrictsNonGDBMethods(t *testing.T) {
 	}
 	if errResp["message"] != "method eth_call not available on dbgserver" {
 		t.Fatalf("unexpected error response = %#v", errResp)
+	}
+}
+
+func TestGDBPauseInterruptsRunningSession(t *testing.T) {
+	contract := engine.Address{19: 0x66}
+	provider := &stubProvider{
+		block:         upstream.Block{Number: big.NewInt(5), GasLimit: 1_000_000, BaseFee: big.NewInt(1), ChainID: big.NewInt(1)},
+		codeByAddress: map[engine.Address][]byte{contract: {0x5b, 0x60, 0x00, 0x56}},
+	}
+	engineRef, err := forkengine.New(forkengine.Config{Provider: provider, Fork: engine.ForkCancun, Block: upstream.BlockNumber(5)})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	server := httptest.NewServer(NewGDBServer(engineRef))
+	defer server.Close()
+
+	session := rpcCall(t, server.URL, "gdb.startCallSession", []any{map[string]any{"from": "0x0000000000000000000000000000000000000001", "to": addressHex(contract), "input": "0x"}, "0x5"}).(map[string]any)
+	sessionID := session["id"].(string)
+
+	continueDone := make(chan map[string]any, 1)
+	continueErr := make(chan error, 1)
+	go func() {
+		result, err := rpcCallResult(server.URL, "gdb.continue", []any{sessionID})
+		if err != nil {
+			continueErr <- err
+			return
+		}
+		continueDone <- result.(map[string]any)
+	}()
+
+	time.Sleep(25 * time.Millisecond)
+	paused := rpcCall(t, server.URL, "gdb.pause", []any{sessionID}).(map[string]any)
+	current := paused["current"].(map[string]any)
+	if current["reason"] != "pause" {
+		t.Fatalf("pause reason = %v, want pause", current["reason"])
+	}
+	select {
+	case err := <-continueErr:
+		t.Fatalf("continue rpc error = %v", err)
+	case result := <-continueDone:
+		current = result["current"].(map[string]any)
+		if current["reason"] != "pause" {
+			t.Fatalf("continue result reason = %v, want pause", current["reason"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for continue request to return after pause")
 	}
 }
 
@@ -572,13 +622,21 @@ func TestDBGServerListAndDeleteBreakpoints(t *testing.T) {
 
 func rpcCall(t *testing.T, url string, method string, params []any) any {
 	t.Helper()
+	result, err := rpcCallResult(url, method, params)
+	if err != nil {
+		t.Fatalf("rpcCallResult() error = %v", err)
+	}
+	return result
+}
+
+func rpcCallResult(url string, method string, params []any) (any, error) {
 	payload, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
 	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
+		return nil, fmt.Errorf("json.Marshal(): %w", err)
 	}
 	resp, err := http.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
-		t.Fatalf("http.Post() error = %v", err)
+		return nil, fmt.Errorf("http.Post(): %w", err)
 	}
 	defer resp.Body.Close()
 	var decoded struct {
@@ -586,12 +644,12 @@ func rpcCall(t *testing.T, url string, method string, params []any) any {
 		Error  map[string]any `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		t.Fatalf("Decode() error = %v", err)
+		return nil, fmt.Errorf("Decode(): %w", err)
 	}
 	if decoded.Error != nil {
-		t.Fatalf("rpc error = %#v", decoded.Error)
+		return nil, fmt.Errorf("rpc error = %#v", decoded.Error)
 	}
-	return decoded.Result
+	return decoded.Result, nil
 }
 
 func rpcCallExpectError(t *testing.T, url string, method string, params []any) map[string]any {

@@ -2,7 +2,7 @@
   "name": "inspethct-vscode",
   "displayName": "Inspethct Debugger",
   "description": "VS Code debugger for Inspethct dbgserver",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "icon": "icon.png",
   "publisher": "DenrianWeiss",
   "repository": "https://github.com/DenrianWeiss/inspethct",

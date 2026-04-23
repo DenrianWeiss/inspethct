@@ -11,6 +11,7 @@ import {
   Breakpoint
 } from "@vscode/debugadapter";
 import * as path from "node:path";
+import * as vscode from "vscode";
 import { DebugProtocol } from "@vscode/debugprotocol";
 import { InspethctLaunchConfig } from "../types";
 import { InspethctRuntime } from "./runtime";
@@ -33,6 +34,7 @@ export class InspethctDebugSession extends LoggingDebugSession {
   private readonly configurationDonePromise: Promise<void>;
   private resolveConfigurationDone?: () => void;
   private readonly processKey: string;
+  private lastErrorNotificationKey = "";
 
   constructor(private readonly processManager: DbgserverProcessManager) {
     super("inspethct-debug.txt");
@@ -52,7 +54,7 @@ export class InspethctDebugSession extends LoggingDebugSession {
       supportsConfigurationDoneRequest: true,
       supportsSetVariable: false,
       supportsEvaluateForHovers: true,
-      supportsReadMemoryRequest: true
+	      supportsReadMemoryRequest: true
     };
     this.sendResponse(response);
     this.sendEvent(new InitializedEvent());
@@ -114,6 +116,7 @@ export class InspethctDebugSession extends LoggingDebugSession {
       response.message = String(error);
       this.sendResponse(response);
       this.sendEvent(new OutputEvent(`Launch failed: ${String(error)}\n`, "stderr"));
+      this.notifyRuntimeError("launch", error);
       this.runtime?.stop();
     }
   }
@@ -259,6 +262,7 @@ export class InspethctDebugSession extends LoggingDebugSession {
       response.success = false;
       response.message = String(error);
       this.sendResponse(response);
+      this.notifyRuntimeError("step", error);
     }
   }
 
@@ -278,6 +282,24 @@ export class InspethctDebugSession extends LoggingDebugSession {
       response.success = false;
       response.message = String(error);
       this.sendResponse(response);
+      this.notifyRuntimeError("continue", error);
+    }
+  }
+
+  protected async pauseRequest(response: DebugProtocol.PauseResponse, _args: DebugProtocol.PauseArguments): Promise<void> {
+    try {
+      const state = await this.runtime!.pause();
+      this.sendResponse(response);
+      if (state.done && !state.current) {
+        this.sendEvent(new TerminatedEvent());
+        return;
+      }
+      this.sendEvent(new StoppedEvent(state.current?.reason || "pause", THREAD_ID));
+    } catch (error) {
+      response.success = false;
+      response.message = String(error);
+      this.sendResponse(response);
+      this.notifyRuntimeError("pause", error);
     }
   }
 
@@ -336,6 +358,55 @@ export class InspethctDebugSession extends LoggingDebugSession {
     const srcTag = frame.functionSource === "openchain" ? " (4byte)" : "";
     const argsPreview = this.formatArgsPreview(frame.arguments);
     return `${prefix} ${tag} ${funcLabel}${argsPreview}${srcTag}`.trim();
+  }
+
+  private notifyRuntimeError(action: string, error: unknown): void {
+    const message = this.formatRuntimeError(error);
+    this.sendEvent(new OutputEvent(`[dap] ${action} failed: ${message}\n`, "stderr"));
+    const raw = String(error);
+    if (this.isUpstreamRuntimeError(raw)) {
+      void this.showUpstreamConfigError(action, message);
+      return;
+    }
+    void vscode.window.showErrorMessage(`Inspethct ${action} failed: ${message}`);
+  }
+
+  private formatRuntimeError(error: unknown): string {
+    const message = String(error);
+    if (/RPC request failed|RPC transport error/i.test(message)) {
+      return `dbgserver unreachable. ${message}`;
+    }
+    if (/upstream|dial tcp|connection refused|no such host|i\/o timeout|deadline exceeded|eth_|debug_trace/i.test(message)) {
+      return `upstream RPC/backend error. ${message}`;
+    }
+    return message;
+  }
+
+  private isUpstreamRuntimeError(message: string): boolean {
+    return /upstream|dial tcp|connection refused|no such host|i\/o timeout|deadline exceeded|eth_|debug_trace/i.test(message);
+  }
+
+  private async showUpstreamConfigError(action: string, message: string): Promise<void> {
+    const key = `${action}:${message}`;
+    if (this.lastErrorNotificationKey === key) {
+      return;
+    }
+    this.lastErrorNotificationKey = key;
+
+    const currentUpstream = this.launchConfig?.upstream?.trim();
+    const detail = currentUpstream ? ` 当前 session upstream: ${currentUpstream}` : "";
+    const choice = await vscode.window.showErrorMessage(
+      `Inspethct ${action} failed: 上游 RPC 连接失败或返回错误。请到 session 设置更新 upstream RPC 地址。${detail}`,
+      "Open Session Settings",
+      "Open Default RPC Setting"
+    );
+    if (choice === "Open Session Settings") {
+      await vscode.commands.executeCommand("workbench.action.debug.configure");
+      return;
+    }
+    if (choice === "Open Default RPC Setting") {
+      await vscode.commands.executeCommand("workbench.action.openSettings", "inspethct.defaultUpstream");
+    }
   }
 
   private formatArgsPreview(args?: import("./runtime").CallArgument[]): string {

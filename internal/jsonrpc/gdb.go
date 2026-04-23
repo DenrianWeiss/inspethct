@@ -308,6 +308,7 @@ func (server *Server) replaySession(ctx context.Context, session *ReplaySession,
 	session.PendingPause = nil
 	session.Current = nil
 	session.CallFrames = session.CallFrames[:0]
+	session.PauseRequested.Store(false)
 
 	debugHooks := engine.NewSimpleHookRegistry()
 	_ = debugHooks.Register(&debugStepHook{session: session, continueMode: continueMode})
@@ -333,6 +334,8 @@ func (server *Server) replaySession(ctx context.Context, session *ReplaySession,
 		})
 	}
 	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, debugHooks)
+	session.ExecutionRunning.Store(true)
+	defer session.ExecutionRunning.Store(false)
 	result, execErr := server.engine.ExecutePreparedCall(prepared)
 	if execErr != nil && !errors.Is(execErr, errReplayPause) && result == nil {
 		return internalError(execErr)
@@ -409,6 +412,10 @@ func (hook *debugStepHook) Fire(ctx *engine.HookContext) (*engine.HookResult, er
 	updateCallFrames(hook.session, ctx)
 	if stepIndex <= hook.session.Position {
 		return &engine.HookResult{Action: engine.ActionContinue}, nil
+	}
+	if hook.session.PauseRequested.Swap(false) {
+		hook.session.PendingPause = capturePause(hook.session, ctx, stepIndex, "pause", "")
+		return &engine.HookResult{Action: engine.ActionHalt, Err: errReplayPause}, nil
 	}
 	if !hook.continueMode && stepIndex == hook.session.Position+1 {
 		hook.session.PendingPause = capturePause(hook.session, ctx, stepIndex, "step", "")

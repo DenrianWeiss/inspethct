@@ -9,6 +9,7 @@ interface DbgserverCapabilities {
   features?: {
     statePatch?: boolean;
     sequenceSession?: boolean;
+    livePause?: boolean;
     tupleAbiAssist?: boolean;
   };
 }
@@ -237,6 +238,15 @@ export class InspethctRuntime {
     this.lastState = await this.rpc!.call<GdbSessionState>("gdb.continue", [this.sessionId]);
     await this.handleSequenceProgress();
     await this.maybeAutoLoadForCurrent();
+    return this.lastState!;
+  }
+
+  async pause(): Promise<GdbSessionState> {
+    this.ensureRpc();
+    if (this.capabilities?.features?.livePause !== true && !this.capabilities?.methods?.includes("gdb.pause")) {
+      throw new Error("dbgserver does not support pause");
+    }
+    this.lastState = await this.rpc!.call<GdbSessionState>("gdb.pause", [this.sessionId], 10000);
     return this.lastState!;
   }
 

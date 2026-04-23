@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"inspethct/internal/contractmeta"
 	"inspethct/internal/engine"
@@ -78,6 +79,14 @@ type ReplaySession struct {
 	// public OpenChain (4byte) signature database. Empty string means
 	// "lookup attempted, no signature available" (negative cache).
 	OpenchainCache map[string]string `json:"-"`
+	// PauseRequested is set by gdb.pause while a session is actively running.
+	// The per-step hook checks it between instructions and turns it into a
+	// regular pause stop without needing to interrupt the engine goroutine.
+	PauseRequested atomic.Bool `json:"-"`
+	// ExecutionRunning is true while replaySession is inside ExecutePreparedCall.
+	// gdb.pause waits for it to flip back to false before returning the stable
+	// paused state to the client.
+	ExecutionRunning atomic.Bool `json:"-"`
 }
 
 type request struct {
@@ -235,6 +244,8 @@ func (server *Server) handle(ctx context.Context, req request) (any, *respError)
 			return nil, rpcErr
 		}
 		return server.advanceSession(sessionID, true)
+	case "gdb.pause":
+		return server.pauseSession(ctx, req.Params)
 	case "gdb.state":
 		sessionID, rpcErr := decodeStringParam(req.Params)
 		if rpcErr != nil {
@@ -286,6 +297,7 @@ var gdbMethodNames = []string{
 	"gdb.startCallSession",
 	"gdb.next",
 	"gdb.continue",
+	"gdb.pause",
 	"gdb.state",
 	"gdb.loadSourceBundle",
 	"gdb.setSourceBreakpoint",
@@ -330,10 +342,12 @@ func (server *Server) capabilities() map[string]any {
 		"features": map[string]any{
 			"statePatch":      true,
 			"sequenceSession": true,
+			"livePause":       true,
 			"tupleAbiAssist":  false,
 		},
 		"notes": []string{
 			"dbgserver exposes replay and call debugging sessions",
+			"continue/next can be interrupted at the next instruction via gdb.pause",
 			"source, function, call, storage, and memory breakpoints are available over RPC",
 			"state patches can be exported and imported between sessions for multi-step carry-over",
 			"sequence sessions orchestrate multi-step call/replay flows with carry modes",
@@ -414,6 +428,38 @@ func (server *Server) advanceSession(sessionID string, all bool) (any, *respErro
 		return nil, &respError{Code: -32602, Message: "unknown gdb session"}
 	}
 	return server.advanceLoadedSession(context.Background(), session, all)
+}
+
+func (server *Server) pauseSession(ctx context.Context, params []json.RawMessage) (any, *respError) {
+	sessionID, rpcErr := decodeStringParam(params)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	server.mu.Lock()
+	session, ok := server.sessions[sessionID]
+	server.mu.Unlock()
+	if !ok {
+		return nil, &respError{Code: -32602, Message: "unknown gdb session"}
+	}
+	if !session.ExecutionRunning.Load() {
+		return server.describeSession(session), nil
+	}
+	session.PauseRequested.Store(true)
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for session.ExecutionRunning.Load() {
+		select {
+		case <-ctx.Done():
+			return nil, &respError{Code: -32001, Message: "pause request cancelled"}
+		case <-timeout.C:
+			return nil, &respError{Code: -32001, Message: "pause request timed out waiting for execution to stop"}
+		case <-ticker.C:
+		}
+	}
+	return server.describeSession(session), nil
 }
 
 // advanceLoadedSession runs (or steps) the given session and returns its
