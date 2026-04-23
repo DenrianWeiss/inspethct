@@ -358,6 +358,16 @@ export class InspethctDebugSession extends LoggingDebugSession {
         current = await this.runtime!.continue();
         continue;
       }
+      if (this.shouldSkipInitialCallBreakpoint(current)) {
+        this.sendEvent(
+          new OutputEvent(
+            `[dap] auto-run attempt=${attempt} skipping call_breakpoint to prefer interface function breakpoint\n`,
+            "console"
+          )
+        );
+        current = await this.runtime!.continue();
+        continue;
+      }
       if (current.current && !transientReasons.has(reason)) {
         return current;
       }
@@ -378,6 +388,13 @@ export class InspethctDebugSession extends LoggingDebugSession {
       return false;
     }
     if ((state.current.step?.pc ?? -1) !== 0) {
+      return false;
+    }
+    return this.hasConfiguredFunctionBreakpoints();
+  }
+
+  private shouldSkipInitialCallBreakpoint(state: Awaited<ReturnType<InspethctRuntime["start"]>>): boolean {
+    if (!state.current || state.current.reason !== "call_breakpoint") {
       return false;
     }
     return this.hasConfiguredFunctionBreakpoints();

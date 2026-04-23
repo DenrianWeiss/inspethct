@@ -308,6 +308,9 @@ export class InspethctRuntime {
     this.sourcePathToFunctionBreakpoints.set(filePath, breakpoints.map((bp) => ({ ...bp })));
 
     const existing = this.sourcePathToFunctionBreakpointIds.get(filePath) ?? [];
+    this.notifier?.info(
+      `[runtime] function breakpoint reset file=${filePath} existing=${existing.length} trackedBefore=${this.interfaceBreakpointLocations.size}`
+    );
     for (const id of existing) {
       await this.rpc!.call("gdb.deleteBreakpoint", [this.sessionId, { id }]);
       this.interfaceBreakpointLocations.delete(id);
@@ -324,6 +327,11 @@ export class InspethctRuntime {
       created.push(breakpoint.id);
       if (breakpoint.interfaceSourceName && breakpoint.interfaceLine) {
         const selector = computeSelector(breakpoint.signature);
+        if (!selector) {
+          this.notifier?.warn(
+            `[runtime] selector compute failed signature=${JSON.stringify(breakpoint.signature)} id=${breakpoint.id}`
+          );
+        }
         const normalizedAddress = normalizeAddress(breakpoint.address);
         this.interfaceBreakpointLocations.set(breakpoint.id, {
           id: breakpoint.id,
@@ -341,8 +349,11 @@ export class InspethctRuntime {
         `[runtime] created function breakpoint id=${breakpoint.id} signature=${breakpoint.signature}${breakpoint.address ? ` address=${breakpoint.address}` : ""}`
       );
     }
+    const selectorSummary = Array.from(this.interfaceBreakpointLocations.values())
+      .map((location) => `${location.selector || "<none>"}:${location.signature}${location.address ? `@${location.address}` : ""}`)
+      .join(";");
     this.notifier?.info(
-      `[runtime] function breakpoint sync file=${filePath} created=${created.length} trackedInterfaceLocations=${this.interfaceBreakpointLocations.size}`
+      `[runtime] function breakpoint sync file=${filePath} created=${created.length} trackedInterfaceLocations=${this.interfaceBreakpointLocations.size} selectors=${selectorSummary || "<none>"}`
     );
     this.sourcePathToFunctionBreakpointIds.set(filePath, created);
   }
@@ -381,8 +392,13 @@ export class InspethctRuntime {
       matchedBy = "selector";
     }
     if (candidates.length === 0) {
+      const registeredSelectorCount = all.filter((candidate) => !!candidate.selector).length;
+      const selectorSamples = all
+        .slice(0, 8)
+        .map((candidate) => `${candidate.selector || "<none>"}:${candidate.signature}${candidate.address ? `@${candidate.address}` : ""}`)
+        .join(";");
       this.notifier?.info(
-        `[runtime] interface resolve context=${context} signature=${signature || "<none>"} selector=${normalizedSelector || "<none>"} codeAddress=${normalizedCodeAddress || "<none>"} result=miss reason=no-candidate`
+        `[runtime] interface resolve context=${context} signature=${signature || "<none>"} selector=${normalizedSelector || "<none>"} codeAddress=${normalizedCodeAddress || "<none>"} result=miss reason=no-candidate tracked=${all.length} trackedWithSelector=${registeredSelectorCount} selectorSamples=${selectorSamples || "<none>"}`
       );
       return undefined;
     }
@@ -412,6 +428,22 @@ export class InspethctRuntime {
       this.notifier?.info(
         `[runtime] interface resolve context=${context} ${matchTag} codeAddress=${normalizedCodeAddress} result=no-address-match mapped=${addressedCandidates.length} unmapped=${unaddressedCandidates.length}`
       );
+      // Some traces report implementation code address while the configured
+      // breakpoint uses a proxy address filter. If there is only one
+      // addressed candidate, prefer mapping it instead of dropping the
+      // interface location entirely.
+      if (addressedCandidates.length === 1 && unaddressedCandidates.length === 0) {
+        const fallbackAddressedMatch = addressedCandidates[0];
+        this.notifier?.info(
+          `[runtime] interface resolve context=${context} ${matchTag} codeAddress=${normalizedCodeAddress} result=address-fallback source=${fallbackAddressedMatch.sourceName}:${fallbackAddressedMatch.line}`
+        );
+        return {
+          sourceName: fallbackAddressedMatch.sourceName,
+          line: fallbackAddressedMatch.line,
+          column: 1,
+          signature: fallbackAddressedMatch.signature
+        };
+      }
     }
 
     if (unaddressedCandidates.length === 0) {

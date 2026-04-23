@@ -27,12 +27,8 @@ type DecodedCall struct {
 
 type lookupResponse struct {
 	Result struct {
-		Function map[string]struct {
-			Name []string `json:"name"`
-		} `json:"function"`
-		Event map[string]struct {
-			Name []string `json:"name"`
-		} `json:"event"`
+		Function map[string]json.RawMessage `json:"function"`
+		Event    map[string]json.RawMessage `json:"event"`
 	} `json:"result"`
 }
 
@@ -97,9 +93,51 @@ func (client Client) lookup(ctx context.Context, kind string, value string) ([]s
 	}
 	key := normalizeHex(value)
 	if kind == "function" {
-		return append([]string(nil), decoded.Result.Function[key].Name...), nil
+		return extractNames(decoded.Result.Function[key])
 	}
-	return append([]string(nil), decoded.Result.Event[key].Name...), nil
+	return extractNames(decoded.Result.Event[key])
+}
+
+func extractNames(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	// Current OpenChain payload shape:
+	//   [{"name":"transfer(address,uint256)", ...}, ...]
+	type entry struct {
+		Name string `json:"name"`
+	}
+	var entries []entry
+	if err := json.Unmarshal(raw, &entries); err == nil {
+		out := make([]string, 0, len(entries))
+		for _, item := range entries {
+			name := strings.TrimSpace(item.Name)
+			if name != "" {
+				out = append(out, name)
+			}
+		}
+		return out, nil
+	}
+
+	// Backward compatibility with the old payload shape:
+	//   {"name": ["transfer(address,uint256)", ...]}
+	type legacy struct {
+		Name []string `json:"name"`
+	}
+	var old legacy
+	if err := json.Unmarshal(raw, &old); err == nil {
+		out := make([]string, 0, len(old.Name))
+		for _, item := range old.Name {
+			name := strings.TrimSpace(item)
+			if name != "" {
+				out = append(out, name)
+			}
+		}
+		return out, nil
+	}
+
+	return nil, fmt.Errorf("unsupported openchain lookup payload: %s", string(raw))
 }
 
 func decodeWithSignature(calldata string, signature string) (DecodedCall, error) {
