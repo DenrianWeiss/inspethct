@@ -131,6 +131,20 @@ type Provider interface {
 	GetBlock(ctx context.Context, block BlockRef) (Block, error)
 }
 
+// AccessListEntry mirrors a single EIP-2930 access list entry attached to a transaction.
+type AccessListEntry struct {
+	Address     engine.Address
+	StorageKeys []engine.Hash
+}
+
+func (entry AccessListEntry) Clone() AccessListEntry {
+	clone := AccessListEntry{Address: entry.Address}
+	if entry.StorageKeys != nil {
+		clone.StorageKeys = append([]engine.Hash(nil), entry.StorageKeys...)
+	}
+	return clone
+}
+
 type Transaction struct {
 	Hash             engine.Hash
 	BlockHash        engine.Hash
@@ -142,6 +156,7 @@ type Transaction struct {
 	GasPrice         *big.Int
 	BlobGasFeeCap    *big.Int
 	BlobHashes       []engine.Hash
+	AccessList       []AccessListEntry
 	Input            []byte
 	Nonce            uint64
 	TransactionIndex *uint64
@@ -165,6 +180,13 @@ func (tx Transaction) Clone() Transaction {
 	}
 	if tx.BlobHashes != nil {
 		clone.BlobHashes = append([]engine.Hash(nil), tx.BlobHashes...)
+	}
+	if tx.AccessList != nil {
+		entries := make([]AccessListEntry, len(tx.AccessList))
+		for i, entry := range tx.AccessList {
+			entries[i] = entry.Clone()
+		}
+		clone.AccessList = entries
 	}
 	if tx.Input != nil {
 		clone.Input = append([]byte(nil), tx.Input...)

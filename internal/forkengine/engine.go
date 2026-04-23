@@ -78,6 +78,7 @@ type CallRequest struct {
 	GasPrice      *big.Int
 	BlobGasFeeCap *big.Int
 	BlobHashes    []engine.Hash
+	AccessList    []upstream.AccessListEntry
 	Block         upstream.BlockRef
 }
 
@@ -233,7 +234,7 @@ func (engineRef *Engine) prepareCallAgainstState(ctx context.Context, req CallRe
 			State:            accountState,
 			Storage:          storageState,
 			TransientStorage: engine.NewInMemoryTransientStorage(),
-			AccessList:       engine.NewSimpleAccessList(),
+			AccessList:       buildPrewarmedAccessList(req.AccessList),
 		},
 	}
 	return prepared, nil
@@ -289,6 +290,7 @@ func (engineRef *Engine) PrepareReplay(ctx context.Context, txHash engine.Hash) 
 		GasPrice:      tx.GasPrice,
 		BlobGasFeeCap: tx.BlobGasFeeCap,
 		BlobHashes:    tx.BlobHashes,
+		AccessList:    tx.AccessList,
 		Block:         executionBlockRef,
 	}, stateView, replayState)
 	if err != nil {
@@ -469,7 +471,7 @@ func (engineRef *Engine) prepareCreateReplay(ctx context.Context, tx upstream.Tr
 			State:            accountState,
 			Storage:          storageState,
 			TransientStorage: engine.NewInMemoryTransientStorage(),
-			AccessList:       engine.NewSimpleAccessList(),
+			AccessList:       buildPrewarmedAccessList(tx.AccessList),
 		},
 	}
 	engineRef.recordReplayState(replayState)
@@ -742,7 +744,7 @@ func (engineRef *Engine) prepareReplayTransactionWithState(ctx context.Context, 
 				State:            accountState,
 				Storage:          storageState,
 				TransientStorage: engine.NewInMemoryTransientStorage(),
-				AccessList:       engine.NewSimpleAccessList(),
+				AccessList:       buildPrewarmedAccessList(tx.AccessList),
 			},
 		}, nil
 	}
@@ -755,8 +757,20 @@ func (engineRef *Engine) prepareReplayTransactionWithState(ctx context.Context, 
 		GasPrice:      tx.GasPrice,
 		BlobGasFeeCap: tx.BlobGasFeeCap,
 		BlobHashes:    tx.BlobHashes,
+		AccessList:    tx.AccessList,
 		Block:         executionBlockRef,
 	}, stateView, replayState)
+}
+
+func buildPrewarmedAccessList(entries []upstream.AccessListEntry) engine.AccessList {
+	list := engine.NewSimpleAccessList()
+	for _, entry := range entries {
+		list.WarmAddress(entry.Address)
+		for _, slot := range entry.StorageKeys {
+			list.WarmSlot(entry.Address, slot)
+		}
+	}
+	return list
 }
 
 func (engineRef *Engine) recordReplayState(replayState *ReplayState) {

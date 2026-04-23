@@ -303,21 +303,27 @@ type rpcBlockWithTransactions struct {
 	Transactions []rpcTransaction `json:"transactions"`
 }
 
+type rpcAccessListEntry struct {
+	Address     string   `json:"address"`
+	StorageKeys []string `json:"storageKeys"`
+}
+
 type rpcTransaction struct {
-	Hash             string   `json:"hash"`
-	BlockHash        string   `json:"blockHash"`
-	BlockNumber      string   `json:"blockNumber"`
-	From             string   `json:"from"`
-	To               *string  `json:"to"`
-	Type             string   `json:"type"`
-	Gas              string   `json:"gas"`
-	GasPrice         string   `json:"gasPrice"`
-	BlobGasFeeCap    string   `json:"maxFeePerBlobGas"`
-	BlobHashes       []string `json:"blobVersionedHashes"`
-	Input            string   `json:"input"`
-	Nonce            string   `json:"nonce"`
-	TransactionIndex *string  `json:"transactionIndex"`
-	Value            string   `json:"value"`
+	Hash             string               `json:"hash"`
+	BlockHash        string               `json:"blockHash"`
+	BlockNumber      string               `json:"blockNumber"`
+	From             string               `json:"from"`
+	To               *string              `json:"to"`
+	Type             string               `json:"type"`
+	Gas              string               `json:"gas"`
+	GasPrice         string               `json:"gasPrice"`
+	BlobGasFeeCap    string               `json:"maxFeePerBlobGas"`
+	BlobHashes       []string             `json:"blobVersionedHashes"`
+	AccessList       []rpcAccessListEntry `json:"accessList"`
+	Input            string               `json:"input"`
+	Nonce            string               `json:"nonce"`
+	TransactionIndex *string              `json:"transactionIndex"`
+	Value            string               `json:"value"`
 }
 
 type rpcReceipt struct {
@@ -423,6 +429,10 @@ func (tx rpcTransaction) intoTransaction() (Transaction, error) {
 	if err != nil {
 		return Transaction{}, err
 	}
+	accessList, err := parseAccessList(tx.AccessList)
+	if err != nil {
+		return Transaction{}, err
+	}
 	input, err := parseHexBytes(tx.Input)
 	if err != nil {
 		return Transaction{}, err
@@ -439,7 +449,7 @@ func (tx rpcTransaction) intoTransaction() (Transaction, error) {
 	if err != nil {
 		return Transaction{}, err
 	}
-	return Transaction{Hash: hash, BlockHash: blockHash, BlockNumber: blockNumber, From: from, To: to, Type: txType, Gas: gas, GasPrice: gasPrice, BlobGasFeeCap: blobGasFeeCap, BlobHashes: blobHashes, Input: input, Nonce: nonce, TransactionIndex: index, Value: value}, nil
+	return Transaction{Hash: hash, BlockHash: blockHash, BlockNumber: blockNumber, From: from, To: to, Type: txType, Gas: gas, GasPrice: gasPrice, BlobGasFeeCap: blobGasFeeCap, BlobHashes: blobHashes, AccessList: accessList, Input: input, Nonce: nonce, TransactionIndex: index, Value: value}, nil
 }
 
 func (receipt rpcReceipt) intoReceipt() (Receipt, error) {
@@ -934,6 +944,25 @@ func parseHashList(inputs []string) ([]engine.Hash, error) {
 		hashes = append(hashes, hash)
 	}
 	return hashes, nil
+}
+
+func parseAccessList(entries []rpcAccessListEntry) ([]AccessListEntry, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	parsed := make([]AccessListEntry, 0, len(entries))
+	for _, entry := range entries {
+		address, err := parseAddress(entry.Address)
+		if err != nil {
+			return nil, err
+		}
+		keys, err := parseHashList(entry.StorageKeys)
+		if err != nil {
+			return nil, err
+		}
+		parsed = append(parsed, AccessListEntry{Address: address, StorageKeys: keys})
+	}
+	return parsed, nil
 }
 
 func parseOptionalHash(input string) (engine.Hash, error) {

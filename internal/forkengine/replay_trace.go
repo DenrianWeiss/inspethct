@@ -463,6 +463,11 @@ func replayGasUsed(tx upstream.Transaction, result *engine.ExecutionResult) uint
 			intrinsic += 16
 		}
 	}
+	// EIP-2930 access list intrinsic cost: 2400 per address + 1900 per storage key.
+	for _, entry := range tx.AccessList {
+		intrinsic += 2400
+		intrinsic += 1900 * uint64(len(entry.StorageKeys))
+	}
 	spent := intrinsic + result.GasUsed
 	refund := result.GasRefund
 	refundCap := spent / 5
