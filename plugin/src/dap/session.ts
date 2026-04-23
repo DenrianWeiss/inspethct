@@ -252,12 +252,26 @@ export class InspethctDebugSession extends LoggingDebugSession {
     for (const line of lines) {
       const interfaceFunctions = interfaceFunctionsByLine.get(line) ?? [];
       if (interfaceFunctions.length > 0) {
+        this.sendEvent(
+          new OutputEvent(
+            `[dap] interface line detected file=${filePath} line=${line} functions=${interfaceFunctions.map((f) => f.signature).join("|")}\n`,
+            "console"
+          )
+        );
         for (const fn of interfaceFunctions) {
           const addresses = resolveMappedAddresses(mapping, sourceName, fn.interfaceName);
+          this.sendEvent(
+            new OutputEvent(
+              `[dap] interface mapping source=${sourceName} interface=${fn.interfaceName} signature=${fn.signature} mappedAddresses=${addresses.join(",") || "<none>"}\n`,
+              "console"
+            )
+          );
           if (addresses.length === 0) {
             plan.functionBreakpoints.push({
               id: `bp-fn-${sourceName}-${line}-${fn.signature}`,
-              signature: fn.signature
+              signature: fn.signature,
+              interfaceSourceName: sourceName,
+              interfaceLine: line
             });
             continue;
           }
@@ -265,7 +279,9 @@ export class InspethctDebugSession extends LoggingDebugSession {
             plan.functionBreakpoints.push({
               id: `bp-fn-${sourceName}-${line}-${fn.signature}-${address}`,
               signature: fn.signature,
-              address
+              address,
+              interfaceSourceName: sourceName,
+              interfaceLine: line
             });
           }
         }
@@ -281,6 +297,12 @@ export class InspethctDebugSession extends LoggingDebugSession {
     }
 
     plan.functionBreakpoints = dedupeFunctionBreakpoints(plan.functionBreakpoints);
+    this.sendEvent(
+      new OutputEvent(
+        `[dap] breakpoint plan file=${filePath} sourceLines=${plan.sourceLines.join(",") || "<none>"} functionCount=${plan.functionBreakpoints.length} skippedInterfaceLines=${plan.skippedInterfaceLines.join(",") || "<none>"}\n`,
+        "console"
+      )
+    );
     return plan;
   }
 
@@ -326,6 +348,16 @@ export class InspethctDebugSession extends LoggingDebugSession {
         return current;
       }
       const reason = current.current?.reason || "";
+      if (this.shouldSkipInitialSourceBreakpoint(current)) {
+        this.sendEvent(
+          new OutputEvent(
+            `[dap] auto-run attempt=${attempt} skipping source_breakpoint at pc=0 to prefer interface function breakpoint\n`,
+            "console"
+          )
+        );
+        current = await this.runtime!.continue();
+        continue;
+      }
       if (current.current && !transientReasons.has(reason)) {
         return current;
       }
@@ -339,6 +371,25 @@ export class InspethctDebugSession extends LoggingDebugSession {
       current = next;
     }
     return current;
+  }
+
+  private shouldSkipInitialSourceBreakpoint(state: Awaited<ReturnType<InspethctRuntime["start"]>>): boolean {
+    if (!state.current || state.current.reason !== "source_breakpoint") {
+      return false;
+    }
+    if ((state.current.step?.pc ?? -1) !== 0) {
+      return false;
+    }
+    return this.hasConfiguredFunctionBreakpoints();
+  }
+
+  private hasConfiguredFunctionBreakpoints(): boolean {
+    for (const plan of this.pendingBreakpoints.values()) {
+      if (plan.functionBreakpoints.length > 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private samePausePoint(a: Awaited<ReturnType<InspethctRuntime["start"]>>, b: Awaited<ReturnType<InspethctRuntime["start"]>>): boolean {
@@ -421,7 +472,11 @@ export class InspethctDebugSession extends LoggingDebugSession {
 
     const baseFrame: DebugProtocol.StackFrame = {
       id: 1,
-      name: this.formatFrameName(current?.step?.op || "EVM", current?.callStack?.[current.callStack.length - 1]),
+      name: this.formatFrameName(
+        current?.step?.op || "EVM",
+        current?.callStack?.[current.callStack.length - 1],
+        current?.reason === "function_breakpoint" ? contractNameFromSourceName(sourceName) : undefined
+      ),
       line: current?.source?.line || 1,
       column: current?.source?.column || 1,
       source: localPath ? new Source(sourceName || "contract", localPath) : undefined
@@ -435,12 +490,21 @@ export class InspethctDebugSession extends LoggingDebugSession {
     // depth-1 .. 0 in order from caller to root.
     for (let i = callStack.length - 2; i >= 0; i--) {
       const f = callStack[i];
+      const resolved = this.runtime?.resolveInterfaceLocation(
+        f.functionSignature,
+        f.codeAddress,
+        `stack-depth-${f.depth}`,
+        f.selector
+      );
+      const resolvedPath = this.runtime?.resolveLocalPath(resolved?.sourceName);
+      const interfaceContractName = contractNameFromSourceName(resolved?.sourceName);
       frames.push({
         id: 100 + f.depth,
-        name: this.formatFrameName(`depth ${f.depth}`, f),
-        line: 0,
-        column: 0,
-        presentationHint: "label"
+        name: this.formatFrameName(`depth ${f.depth}`, f, interfaceContractName),
+        line: resolved?.line ?? 0,
+        column: resolved?.column ?? 0,
+        source: resolvedPath ? new Source(resolved?.sourceName || f.contractName || "contract", resolvedPath) : undefined,
+        presentationHint: resolvedPath ? undefined : "label"
       });
     }
 
@@ -451,12 +515,12 @@ export class InspethctDebugSession extends LoggingDebugSession {
     this.sendResponse(response);
   }
 
-  private formatFrameName(prefix: string, frame?: import("./runtime").CallFrameInfo): string {
+  private formatFrameName(prefix: string, frame?: import("./runtime").CallFrameInfo, contractNameOverride?: string): string {
     if (!frame) {
       return prefix;
     }
     const tag = frame.callType ? `[${frame.callType}]` : "";
-    const contract = frame.contractName || frame.codeAddress;
+    const contract = contractNameOverride || frame.contractName || frame.codeAddress;
     let func = frame.functionName || frame.functionSignature;
     if (!func && frame.selector) {
       func = frame.selector;
@@ -890,6 +954,14 @@ function splitContractHint(contract: string): [string, string] {
 
 function normalizeSourcePath(value: string): string {
   return value.split("\\").join("/").replace(/^\.\//, "").trim();
+}
+
+function contractNameFromSourceName(sourceName: string | undefined): string | undefined {
+  if (!sourceName) {
+    return undefined;
+  }
+  const base = sourceName.split("/").pop() ?? sourceName;
+  return base.replace(/\.sol$/i, "") || undefined;
 }
 
 function normalizeAddress(value: string): string | undefined {

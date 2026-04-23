@@ -83,16 +83,28 @@ func AutoMatchBundle(ctx context.Context, provider AutoSourceProvider, addr engi
 		matches, _ := FindLocalBytecodeMatches(cfg.ProjectRoot, code)
 		if len(matches) > 0 {
 			best := matches[0]
+			ratio := 0.0
+			if best.TotalBytes > 0 {
+				ratio = float64(best.MatchedBytes) / float64(best.TotalBytes)
+			}
 			localOpts := baseOpts
 			localOpts.ContractName = best.ContractName
 			localOpts.SourceName = best.SourceName
 			bundle, loadErr := LoadBundleFromBuildInfoMatch(best, localOpts)
 			if loadErr == nil {
 				applyProxy(bundle, proxyInfo)
+				diagnostics := []string{
+					fmt.Sprintf("local match %s/%s (%d/%d bytes, exact=%t, confidence=%.3f)",
+						best.SourceName, best.ContractName, best.MatchedBytes, best.TotalBytes, best.Exact, ratio),
+				}
+				if !best.Exact && ratio < 0.80 {
+					diagnostics = append(diagnostics,
+						fmt.Sprintf("warning: local bytecode match confidence may be low (%.3f < 0.800); using local match to avoid explorer fallback", ratio))
+				}
 				if cfg.CacheDir != "" {
 					SaveCachedBundle(cfg.CacheDir, codeHash, bundle, "local-bytecode")
 				}
-				return &AutoLoadResult{Bundle: bundle, Source: "local-bytecode", Match: &best}, nil
+				return &AutoLoadResult{Bundle: bundle, Source: "local-bytecode", Match: &best, Diagnostics: diagnostics}, nil
 			}
 		}
 	}

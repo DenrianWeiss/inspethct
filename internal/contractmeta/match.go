@@ -72,6 +72,16 @@ type BytecodeMatch struct {
 	Exact         bool
 }
 
+// Length and similarity thresholds for considering an artifact a candidate.
+// We require the artifact to be roughly the same size as the on-chain code
+// (to avoid matching arbitrary contracts that happen to share a long PUSH/RETURN
+// preamble) and require a meaningful prefix match.
+const (
+	localMatchLengthRatio = 0.9 // |a-b|/max(a,b) must be <= 1 - this
+	localMatchPrefixRatio = 0.6 // matched/total must be >= this to be a candidate
+	localMatchMinBytes    = 64  // additionally require at least this many matched bytes
+)
+
 // FindLocalBytecodeMatches scans local Foundry/Hardhat build-info under projectRoot looking for a
 // contract whose deployedBytecode matches onChain. Returns matches sorted by best score first.
 func FindLocalBytecodeMatches(projectRoot string, onChain []byte) ([]BytecodeMatch, error) {
@@ -102,14 +112,30 @@ func FindLocalBytecodeMatches(projectRoot string, onChain []byte) ([]BytecodeMat
 				if len(artifactCode) == 0 {
 					continue
 				}
+				normalizedArtifact := normalizeBytecode(artifactCode)
+				if len(normalizedArtifact) == 0 {
+					continue
+				}
+				// Length sanity check: the artifact and on-chain code must be
+				// roughly the same size. A contract whose normalized bytecode
+				// length differs significantly is almost certainly not the same
+				// program.
+				a, b := len(target), len(normalizedArtifact)
+				lo, hi := a, b
+				if lo > hi {
+					lo, hi = hi, lo
+				}
+				if float64(lo)/float64(hi) < localMatchLengthRatio {
+					continue
+				}
 				matched, total := bytecodeSimilarity(target, artifactCode)
-				if matched == 0 {
+				if total == 0 || matched < localMatchMinBytes {
 					continue
 				}
-				if total < len(target)/2 && matched < len(target)/2 {
+				if float64(matched)/float64(total) < localMatchPrefixRatio {
 					continue
 				}
-				exact := matched == total && total > 0 && len(target) == len(normalizeBytecode(artifactCode))
+				exact := matched == total && total > 0 && len(target) == len(normalizedArtifact)
 				results = append(results, BytecodeMatch{
 					SourceName:    sourceName,
 					ContractName:  contractName,

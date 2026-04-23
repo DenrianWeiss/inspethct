@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { id as ethersId } from "ethers";
 import { RpcClient } from "../services/rpcClient";
 import { DbgserverProcessManager } from "../services/processManager";
 import { InspethctLaunchConfig, SequenceStep, SourceBundleConfig } from "../types";
@@ -144,6 +145,17 @@ export interface FunctionBreakpointSpec {
   id: string;
   signature: string;
   address?: string;
+  interfaceSourceName?: string;
+  interfaceLine?: number;
+}
+
+interface InterfaceBreakpointLocation {
+  id: string;
+  signature: string;
+  selector?: string;
+  address?: string;
+  sourceName: string;
+  line: number;
 }
 
 export class InspethctRuntime {
@@ -158,6 +170,7 @@ export class InspethctRuntime {
   private readonly sourcePathToFunctionBreakpointIds = new Map<string, string[]>();
   private readonly sourcePathToLines = new Map<string, number[]>();
   private readonly sourcePathToFunctionBreakpoints = new Map<string, FunctionBreakpointSpec[]>();
+  private readonly interfaceBreakpointLocations = new Map<string, InterfaceBreakpointLocation>();
   private capabilities?: DbgserverCapabilities;
   private readonly autoLoadedAddresses = new Set<string>();
 
@@ -297,6 +310,7 @@ export class InspethctRuntime {
     const existing = this.sourcePathToFunctionBreakpointIds.get(filePath) ?? [];
     for (const id of existing) {
       await this.rpc!.call("gdb.deleteBreakpoint", [this.sessionId, { id }]);
+      this.interfaceBreakpointLocations.delete(id);
       this.notifier?.info(`[runtime] deleted function breakpoint id=${id}`);
     }
 
@@ -308,10 +322,28 @@ export class InspethctRuntime {
       }
       await this.rpc!.call("gdb.setFunctionBreakpoint", [this.sessionId, body]);
       created.push(breakpoint.id);
+      if (breakpoint.interfaceSourceName && breakpoint.interfaceLine) {
+        const selector = computeSelector(breakpoint.signature);
+        const normalizedAddress = normalizeAddress(breakpoint.address);
+        this.interfaceBreakpointLocations.set(breakpoint.id, {
+          id: breakpoint.id,
+          signature: breakpoint.signature,
+          selector,
+          address: normalizedAddress,
+          sourceName: breakpoint.interfaceSourceName,
+          line: breakpoint.interfaceLine
+        });
+        this.notifier?.info(
+          `[runtime] interface location registered id=${breakpoint.id} signature=${breakpoint.signature} selector=${selector || "<none>"} address=${normalizedAddress || "<none>"} source=${breakpoint.interfaceSourceName}:${breakpoint.interfaceLine}`
+        );
+      }
       this.notifier?.info(
         `[runtime] created function breakpoint id=${breakpoint.id} signature=${breakpoint.signature}${breakpoint.address ? ` address=${breakpoint.address}` : ""}`
       );
     }
+    this.notifier?.info(
+      `[runtime] function breakpoint sync file=${filePath} created=${created.length} trackedInterfaceLocations=${this.interfaceBreakpointLocations.size}`
+    );
     this.sourcePathToFunctionBreakpointIds.set(filePath, created);
   }
 
@@ -321,7 +353,126 @@ export class InspethctRuntime {
   }
 
   getState(): GdbSessionState | undefined {
+    if (!this.lastState) {
+      return undefined;
+    }
+    // Apply interface source correction before returning
+    this.applyInterfaceSourceCorrection(this.lastState);
     return this.lastState;
+  }
+
+  resolveInterfaceLocation(
+    signature: string | undefined,
+    codeAddress: string | undefined,
+    context = "frame",
+    selector?: string
+  ): { sourceName: string; line: number; column: number; signature?: string } | undefined {
+    const normalizedSelector = normalizeSelector(selector);
+    if (!signature && !normalizedSelector) {
+      this.notifier?.info(`[runtime] interface resolve context=${context} skipped reason=no-signature-or-selector`);
+      return undefined;
+    }
+    const normalizedCodeAddress = normalizeAddress(codeAddress);
+    const all = Array.from(this.interfaceBreakpointLocations.values());
+    let candidates = signature ? all.filter((candidate) => candidate.signature === signature) : [];
+    let matchedBy: "signature" | "selector" = "signature";
+    if (candidates.length === 0 && normalizedSelector) {
+      candidates = all.filter((candidate) => candidate.selector === normalizedSelector);
+      matchedBy = "selector";
+    }
+    if (candidates.length === 0) {
+      this.notifier?.info(
+        `[runtime] interface resolve context=${context} signature=${signature || "<none>"} selector=${normalizedSelector || "<none>"} codeAddress=${normalizedCodeAddress || "<none>"} result=miss reason=no-candidate`
+      );
+      return undefined;
+    }
+    this.notifier?.info(
+      `[runtime] interface resolve context=${context} signature=${signature || "<none>"} selector=${normalizedSelector || "<none>"} codeAddress=${normalizedCodeAddress || "<none>"} candidates=${candidates
+        .map((c) => `${c.sourceName}:${c.line}#${c.signature}${c.address ? `@${c.address}` : ""}`)
+        .join(";")}`
+    );
+    const matchTag = `matched-by=${matchedBy}`;
+
+    const addressedCandidates = candidates.filter((candidate) => candidate.address);
+    const unaddressedCandidates = candidates.filter((candidate) => !candidate.address);
+
+    if (addressedCandidates.length > 0 && normalizedCodeAddress) {
+      const exactAddressMatch = addressedCandidates.find((candidate) => candidate.address === normalizedCodeAddress);
+      if (exactAddressMatch) {
+        this.notifier?.info(
+          `[runtime] interface resolve context=${context} ${matchTag} codeAddress=${normalizedCodeAddress} result=address-match source=${exactAddressMatch.sourceName}:${exactAddressMatch.line}`
+        );
+        return {
+          sourceName: exactAddressMatch.sourceName,
+          line: exactAddressMatch.line,
+          column: 1,
+          signature: exactAddressMatch.signature
+        };
+      }
+      this.notifier?.info(
+        `[runtime] interface resolve context=${context} ${matchTag} codeAddress=${normalizedCodeAddress} result=no-address-match mapped=${addressedCandidates.length} unmapped=${unaddressedCandidates.length}`
+      );
+    }
+
+    if (unaddressedCandidates.length === 0) {
+      this.notifier?.info(
+        `[runtime] interface resolve context=${context} ${matchTag} codeAddress=${normalizedCodeAddress || "<none>"} result=miss reason=address-only-candidates`
+      );
+      return undefined;
+    }
+
+    const fallbackMatch = unaddressedCandidates[0];
+    this.notifier?.info(
+      `[runtime] interface resolve context=${context} ${matchTag} codeAddress=${normalizedCodeAddress || "<none>"} result=unmapped-fallback source=${fallbackMatch.sourceName}:${fallbackMatch.line} candidates=${unaddressedCandidates.length}`
+    );
+    return {
+      sourceName: fallbackMatch.sourceName,
+      line: fallbackMatch.line,
+      column: 1,
+      signature: fallbackMatch.signature
+    };
+  }
+
+  private applyInterfaceSourceCorrection(state: GdbSessionState): void {
+    if (!state.current || state.current.reason !== "function_breakpoint") {
+      return;
+    }
+    const signature = extractFunctionBreakpointSignature(state.current.breakpoint);
+    const callStack = state.current.callStack ?? [];
+    const topFrame = callStack[callStack.length - 1];
+    const resolved = this.resolveInterfaceLocation(
+      signature,
+      state.current.codeAddress,
+      "current-breakpoint",
+      topFrame?.selector
+    );
+    if (!resolved) {
+      return;
+    }
+    if (!state.current.source) {
+      state.current.source = {};
+    }
+    state.current.source.sourceName = resolved.sourceName;
+    state.current.source.line = resolved.line;
+    state.current.source.column = resolved.column;
+    if (topFrame && resolved.signature) {
+      const prevSignature = topFrame.functionSignature || "<none>";
+      const prevName = topFrame.functionName || "<none>";
+      const prevContract = topFrame.contractName || "<none>";
+      topFrame.functionSignature = resolved.signature;
+      const idx = resolved.signature.indexOf("(");
+      topFrame.functionName = idx > 0 ? resolved.signature.slice(0, idx) : resolved.signature;
+      if (!topFrame.contractName) {
+        topFrame.contractName = resolved.sourceName.split("/").pop()?.replace(/\.sol$/i, "") || topFrame.contractName;
+      }
+      this.notifier?.info(
+        `[runtime] interface correction applied source=${resolved.sourceName}:${resolved.line} selector=${topFrame.selector || "<none>"} signature=${prevSignature}->${topFrame.functionSignature || "<none>"} functionName=${prevName}->${topFrame.functionName || "<none>"} contract=${prevContract}->${topFrame.contractName || "<none>"}`
+      );
+    } else {
+      this.notifier?.info(
+        `[runtime] interface correction applied source=${resolved.sourceName}:${resolved.line} without-top-frame-signature-update`
+      );
+    }
   }
 
   resolveLocalPath(sourceName: string | undefined): string | undefined {
@@ -610,5 +761,48 @@ export class InspethctRuntime {
       return;
     }
     await this.setFileBreakpoints(filePath, lines, functionBreakpoints);
+  }
+}
+
+function extractFunctionBreakpointSignature(display: string | undefined): string | undefined {
+  if (!display) {
+    return undefined;
+  }
+  const match = /^function\s+(.+)$/.exec(display.trim());
+  return match?.[1]?.trim() || undefined;
+}
+
+function normalizeAddress(address: string | undefined): string | undefined {
+  if (!address) {
+    return undefined;
+  }
+  const trimmed = address.trim().toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+function normalizeSelector(selector: string | undefined): string | undefined {
+  if (!selector) {
+    return undefined;
+  }
+  const trimmed = selector.trim().toLowerCase();
+  const withPrefix = trimmed.startsWith("0x") ? trimmed : `0x${trimmed}`;
+  if (!/^0x[0-9a-f]{8}$/.test(withPrefix)) {
+    return undefined;
+  }
+  return withPrefix;
+}
+
+function computeSelector(signature: string | undefined): string | undefined {
+  if (!signature) {
+    return undefined;
+  }
+  try {
+    const hash = ethersId(signature);
+    return hash.slice(0, 10).toLowerCase();
+  } catch {
+    return undefined;
   }
 }
