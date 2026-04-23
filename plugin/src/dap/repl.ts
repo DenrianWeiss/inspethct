@@ -1,4 +1,4 @@
-import { GdbSessionState, InspethctRuntime, LocalVariable, StorageVariable } from "./runtime";
+import { GdbSessionState, InspethctRuntime, LocalVariable, PeekSnapshot, PeekVariable, StorageVariable } from "./runtime";
 
 /**
  * runRepl interprets a single CLI-style command line typed into the VS Code
@@ -32,6 +32,18 @@ export async function runRepl(
     case "step":
     case "next": {
       const state = await runtime.next();
+      return formatStateLine(state);
+    }
+    case "si":
+    case "stepin":
+    case "step-in": {
+      const state = await runtime.stepIn();
+      return formatStateLine(state);
+    }
+    case "so":
+    case "stepout":
+    case "step-out": {
+      const state = await runtime.stepOut();
       return formatStateLine(state);
     }
     case "state": {
@@ -165,7 +177,7 @@ async function handleBreak(args: string[], runtime: InspethctRuntime): Promise<s
 
 async function handleInfo(args: string[], runtime: InspethctRuntime): Promise<string> {
   if (args.length === 0) {
-    return "usage: info <breakpoints|locals|stack|frames|memory|storage|transient|state>";
+    return "usage: info <breakpoints|locals|stack|frames|memory|storage|transient|peek|state>";
   }
   const state = runtime.getState();
   const current = state?.current;
@@ -247,6 +259,15 @@ async function handleInfo(args: string[], runtime: InspethctRuntime): Promise<st
       }
       return entries.map(formatStorage).join("\n");
     }
+    case "peek":
+    case "variables":
+    case "vars": {
+      const peek = current?.peek;
+      if (!peek) {
+        return "no peek snapshot for current pause";
+      }
+      return formatPeekSnapshot(peek);
+    }
     case "state":
       return formatStateLine(state);
     default:
@@ -324,14 +345,16 @@ function helpText(topic?: string): string {
     return [
       "Commands:",
       "  c | continue                  resume to next breakpoint",
-      "  n | s | step | next           single instruction step",
+      "  n | s | step | next           step (source line if available, else instruction)",
+      "  si | stepin                   step in (prefer entering called source frame)",
+      "  so | stepout                  step out (run until caller frame)",
       "  state                         show current pause summary",
       "  b line <src>:<line>[:<col>]   set source breakpoint",
       "  b func <signature>            set function breakpoint",
       "  b call <addr|signature>       set call breakpoint",
       "  b storage <addr> <slot> [acc] set storage breakpoint",
       "  b memory <off> <size> [acc]   set memory breakpoint",
-      "  info breakpoints|locals|stack|frames|memory|storage|transient|state",
+      "  info breakpoints|locals|stack|frames|memory|storage|transient|peek|state",
       "  print storage <name|slot>",
       "  print memory <off> <size>     hex dump (uses gdb.readMemory)",
       "  x <off> <size>                alias for print memory",
@@ -377,6 +400,51 @@ function formatLocal(local: LocalVariable): string {
 
 function formatStorage(entry: StorageVariable): string {
   return `  ${(entry.name || entry.slot).padEnd(28)} ${entry.slot}  ${entry.value}  ${entry.type ?? ""}`.trimEnd();
+}
+
+function formatPeekSnapshot(snap: PeekSnapshot): string {
+  const lines: string[] = [];
+  const header = [snap.contract, snap.function].filter(Boolean).join(".");
+  if (header) {
+    lines.push(`# ${header} @ pc=${snap.pc}`);
+  }
+  const sections: Array<[string, PeekVariable[] | undefined]> = [
+    ["locals", snap.locals],
+    ["storage", snap.storage],
+    ["transient", snap.transient],
+    ["immutables", snap.immutables],
+  ];
+  for (const [label, vars] of sections) {
+    if (!vars || vars.length === 0) {
+      continue;
+    }
+    lines.push(`${label}:`);
+    for (const v of vars) {
+      formatPeekVariable(v, 1, lines);
+    }
+  }
+  if (snap.notes && snap.notes.length > 0) {
+    lines.push(`notes: ${snap.notes.join("; ")}`);
+  }
+  return lines.length === 0 ? "peek snapshot empty" : lines.join("\n");
+}
+
+function formatPeekVariable(v: PeekVariable, depth: number, out: string[]): void {
+  const indent = "  ".repeat(depth);
+  const value = v.value && v.value.length > 0 ? v.value : `<${v.confidence ?? "unavailable"}>`;
+  const tags: string[] = [];
+  if (v.confidence) tags.push(v.confidence);
+  if (v.location?.kind && v.location.kind !== "none") tags.push(v.location.kind);
+  if (v.location?.slot) tags.push(`slot=${v.location.slot}`);
+  if (typeof v.location?.offset === "number" && v.location.offset > 0) tags.push(`off=0x${v.location.offset.toString(16)}`);
+  const tagStr = tags.length > 0 ? ` (${tags.join(",")})` : "";
+  const noteStr = v.note ? `  // ${v.note}` : "";
+  out.push(`${indent}${v.kind.padEnd(9)} ${v.name.padEnd(24)} ${(v.type || "").padEnd(20)} ${value}${tagStr}${noteStr}`);
+  if (v.children && v.children.length > 0) {
+    for (const child of v.children) {
+      formatPeekVariable(child, depth + 1, out);
+    }
+  }
 }
 
 function formatHexDump(baseOffset: number, bytes: Uint8Array): string {

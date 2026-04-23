@@ -17,6 +17,7 @@ import (
 	"inspethct/internal/forkengine"
 	"inspethct/internal/forkengine/ext"
 	"inspethct/internal/forkengine/upstream"
+	"inspethct/internal/varpeeker"
 )
 
 type Server struct {
@@ -87,6 +88,11 @@ type ReplaySession struct {
 	// gdb.pause waits for it to flip back to false before returning the stable
 	// paused state to the client.
 	ExecutionRunning atomic.Bool `json:"-"`
+	// VarTrackers stores per-code-address varpeeker memory-write trackers
+	// attached as engine hooks for the duration of execution. Keyed by
+	// lowercased code address hex; populated lazily when the first bundle
+	// for a given code address is loaded into the active replay.
+	VarTrackers map[string]*varpeeker.Tracker `json:"-"`
 }
 
 type request struct {
@@ -284,6 +290,8 @@ func (server *Server) handle(ctx context.Context, req request) (any, *respError)
 		return server.nextStepSession(ctx, req.Params)
 	case "gdb.configureAutoMatch":
 		return server.configureAutoMatch(ctx, req.Params)
+	case "gdb.peekVariables":
+		return server.peekVariables(req.Params)
 	default:
 		return nil, &respError{Code: -32601, Message: fmt.Sprintf("method %s not found", req.Method)}
 	}
@@ -315,6 +323,7 @@ var gdbMethodNames = []string{
 	"gdb.startSequenceSession",
 	"gdb.nextStepSession",
 	"gdb.configureAutoMatch",
+	"gdb.peekVariables",
 }
 
 var gdbAllowedMethods = func() map[string]struct{} {

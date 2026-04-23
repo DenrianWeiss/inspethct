@@ -54,6 +54,39 @@ export interface CallArgument {
   value: string;
 }
 
+export interface PeekLocation {
+  kind: string;
+  slot?: string;
+  offset?: number;
+  length?: number;
+  stackIndex?: number;
+}
+
+export interface PeekVariable {
+  name: string;
+  kind: string;
+  type: string;
+  storageLocation?: string;
+  declaredAtLine?: number;
+  sourceId?: number;
+  value?: string;
+  confidence?: string;
+  location?: PeekLocation;
+  note?: string;
+  children?: PeekVariable[];
+}
+
+export interface PeekSnapshot {
+  function?: string;
+  contract?: string;
+  pc: number;
+  locals?: PeekVariable[];
+  storage?: PeekVariable[];
+  transient?: PeekVariable[];
+  immutables?: PeekVariable[];
+  notes?: string[];
+}
+
 export interface CallFrameInfo {
   depth: number;
   contractAddress: string;
@@ -107,6 +140,7 @@ export interface GdbSessionState {
     storageAccess?: unknown;
     memoryAccess?: unknown;
     callStack?: CallFrameInfo[];
+    peek?: PeekSnapshot;
   };
   call?: {
     from: string;
@@ -248,11 +282,86 @@ export class InspethctRuntime {
   }
 
   async next(): Promise<GdbSessionState> {
-    this.ensureRpc();
-    this.lastState = await this.rpc!.call<GdbSessionState>("gdb.next", [this.sessionId]);
-    await this.handleSequenceProgress();
-    await this.maybeAutoLoadForCurrent();
-    return this.lastState!;
+    const before = this.lastState;
+    if (!hasSourceLocation(before)) {
+      return this.nextInstruction();
+    }
+
+    const start = sourceLocationKey(before);
+    let state = before;
+    for (let i = 0; i < 512; i++) {
+      state = await this.nextInstruction();
+      if (state.done || !state.current) {
+        return state;
+      }
+      if (state.current.reason !== "step") {
+        return state;
+      }
+      if (!hasSourceLocation(state)) {
+        return state;
+      }
+      if (sourceLocationKey(state) !== start) {
+        return state;
+      }
+    }
+    return state!;
+  }
+
+  async stepIn(): Promise<GdbSessionState> {
+    const before = this.lastState;
+    if (!hasSourceLocation(before)) {
+      return this.nextInstruction();
+    }
+
+    const start = sourceLocationKey(before);
+    const startDepth = callDepth(before);
+    let state = before;
+    for (let i = 0; i < 1024; i++) {
+      state = await this.nextInstruction();
+      if (state.done || !state.current) {
+        return state;
+      }
+      if (state.current.reason !== "step") {
+        return state;
+      }
+      const depth = callDepth(state);
+      if (depth > startDepth && hasSourceLocation(state)) {
+        return state;
+      }
+      if (hasSourceLocation(state) && sourceLocationKey(state) !== start) {
+        return state;
+      }
+    }
+    return state!;
+  }
+
+  async stepOut(): Promise<GdbSessionState> {
+    const before = this.lastState;
+    if (!hasSourceLocation(before)) {
+      return this.nextInstruction();
+    }
+
+    const start = sourceLocationKey(before);
+    const startDepth = callDepth(before);
+    let state = before;
+    for (let i = 0; i < 2048; i++) {
+      state = await this.nextInstruction();
+      if (state.done || !state.current) {
+        return state;
+      }
+      if (state.current.reason !== "step") {
+        return state;
+      }
+      const depth = callDepth(state);
+      if (depth < startDepth) {
+        return state;
+      }
+      // Root frame cannot step out; degrade to source-line stepping.
+      if (startDepth === 0 && hasSourceLocation(state) && sourceLocationKey(state) !== start) {
+        return state;
+      }
+    }
+    return state!;
   }
 
   async continue(): Promise<GdbSessionState> {
@@ -704,6 +813,14 @@ export class InspethctRuntime {
     }
   }
 
+  private async nextInstruction(): Promise<GdbSessionState> {
+    this.ensureRpc();
+    this.lastState = await this.rpc!.call<GdbSessionState>("gdb.next", [this.sessionId]);
+    await this.handleSequenceProgress();
+    await this.maybeAutoLoadForCurrent();
+    return this.lastState!;
+  }
+
   private async loadSourceBundle(bundle: SourceBundleConfig, reason: string): Promise<void> {
     this.ensureRpc();
     try {
@@ -837,4 +954,22 @@ function computeSelector(signature: string | undefined): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function hasSourceLocation(state: GdbSessionState | undefined): boolean {
+  return !!state?.current?.source?.sourceName && typeof state.current.source.line === "number" && state.current.source.line > 0;
+}
+
+function sourceLocationKey(state: GdbSessionState | undefined): string {
+  const sourceName = state?.current?.source?.sourceName ?? "";
+  const line = state?.current?.source?.line ?? 0;
+  return `${sourceName}:${line}`;
+}
+
+function callDepth(state: GdbSessionState | undefined): number {
+  const frames = state?.current?.callStack;
+  if (frames && frames.length > 0) {
+    return Math.max(0, frames.length - 1);
+  }
+  return Math.max(0, state?.current?.step?.depth ?? 0);
 }

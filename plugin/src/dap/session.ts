@@ -441,6 +441,40 @@ export class InspethctDebugSession extends LoggingDebugSession {
     }
   }
 
+  protected async stepInRequest(response: DebugProtocol.StepInResponse, _args: DebugProtocol.StepInArguments): Promise<void> {
+    try {
+      const state = await this.runtime!.stepIn();
+      this.sendResponse(response);
+      if (state.done && !state.current) {
+        this.sendEvent(new TerminatedEvent());
+        return;
+      }
+      this.sendEvent(new StoppedEvent(state.current?.reason || "step", THREAD_ID));
+    } catch (error) {
+      response.success = false;
+      response.message = String(error);
+      this.sendResponse(response);
+      this.notifyRuntimeError("step in", error);
+    }
+  }
+
+  protected async stepOutRequest(response: DebugProtocol.StepOutResponse, _args: DebugProtocol.StepOutArguments): Promise<void> {
+    try {
+      const state = await this.runtime!.stepOut();
+      this.sendResponse(response);
+      if (state.done && !state.current) {
+        this.sendEvent(new TerminatedEvent());
+        return;
+      }
+      this.sendEvent(new StoppedEvent(state.current?.reason || "step", THREAD_ID));
+    } catch (error) {
+      response.success = false;
+      response.message = String(error);
+      this.sendResponse(response);
+      this.notifyRuntimeError("step out", error);
+    }
+  }
+
   protected async continueRequest(
     response: DebugProtocol.ContinueResponse,
     _args: DebugProtocol.ContinueArguments
@@ -620,6 +654,7 @@ export class InspethctDebugSession extends LoggingDebugSession {
     const scopes = [
       new Scope("Step", this.variableHandles.create({ title: "step", content: current?.step ?? {} }), false),
       new Scope("Locals", this.variableHandles.create({ title: "locals", content: { kind: "locals", locals: current?.locals ?? [] } }), false),
+      new Scope("Peek", this.variableHandles.create({ title: "peek", content: { kind: "peek-root", snapshot: current?.peek } }), true),
       new Scope("Storage", this.variableHandles.create({ title: "storage", content: { kind: "storage-list", entries: current?.storage ?? [] } }), false),
       new Scope("Transient", this.variableHandles.create({ title: "transient", content: { kind: "storage-list", entries: current?.transient ?? [] } }), false),
       new Scope("Memory", this.variableHandles.create({
@@ -681,6 +716,12 @@ export class InspethctDebugSession extends LoggingDebugSession {
           return this.renderStorageList(content as StorageListBag);
         case "storage-entry":
           return this.renderStorageEntry(content as StorageEntryBag);
+        case "peek-root":
+          return this.renderPeekRoot(content as PeekRootBag);
+        case "peek-list":
+          return this.renderPeekList(content as PeekListBag);
+        case "peek-children":
+          return this.renderPeekChildren(content as PeekChildrenBag);
       }
     }
     return flattenObject(content);
@@ -838,6 +879,83 @@ export class InspethctDebugSession extends LoggingDebugSession {
     ];
   }
 
+  private renderPeekRoot(bag: PeekRootBag): DebugProtocol.Variable[] {
+    const snap = bag.snapshot;
+    if (!snap) {
+      return [{ name: "<no peek>", value: "varpeeker snapshot unavailable", variablesReference: 0 }];
+    }
+    const sections: Array<[string, import("./runtime").PeekVariable[] | undefined]> = [
+      ["locals", snap.locals],
+      ["storage", snap.storage],
+      ["transient", snap.transient],
+      ["immutables", snap.immutables]
+    ];
+    const out: DebugProtocol.Variable[] = [];
+    out.push({ name: "pc", value: `0x${snap.pc.toString(16)}`, variablesReference: 0 });
+    if (snap.contract || snap.function) {
+      out.push({ name: "scope", value: [snap.contract, snap.function].filter(Boolean).join(".") || "?", variablesReference: 0 });
+    }
+    for (const [label, items] of sections) {
+      if (!items || items.length === 0) {
+        continue;
+      }
+      const ref = this.variableHandles.create({
+        title: `peek:${label}`,
+        content: { kind: "peek-list", label, items } satisfies PeekListBag
+      });
+      out.push({ name: label, value: `${items.length} entries`, variablesReference: ref });
+    }
+    if (out.length === 0) {
+      out.push({ name: "<empty>", value: "no decoded variables", variablesReference: 0 });
+    }
+    if (snap.notes && snap.notes.length > 0) {
+      out.push({ name: "notes", value: snap.notes.join("; "), variablesReference: 0 });
+    }
+    return out;
+  }
+
+  private renderPeekList(bag: PeekListBag): DebugProtocol.Variable[] {
+    return bag.items.map((v) => this.peekVariableToDap(v));
+  }
+
+  private renderPeekChildren(bag: PeekChildrenBag): DebugProtocol.Variable[] {
+    const children = bag.parent.children ?? [];
+    if (children.length === 0) {
+      return [{ name: "<no children>", value: "", variablesReference: 0 }];
+    }
+    return children.map((v) => this.peekVariableToDap(v));
+  }
+
+  private peekVariableToDap(v: import("./runtime").PeekVariable): DebugProtocol.Variable {
+    const hasValue = !!v.value && v.value.length > 0;
+    const display = hasValue ? v.value! : `<${v.confidence ?? "unavailable"}>`;
+    const tags: string[] = [];
+    if (v.confidence) tags.push(v.confidence);
+    if (v.location?.kind && v.location.kind !== "none") tags.push(v.location.kind);
+    if (v.location?.slot) tags.push(`slot=${v.location.slot}`);
+    if (typeof v.location?.stackIndex === "number" && v.location.stackIndex > 0) tags.push(`stack[${v.location.stackIndex - 1}]`);
+    if (typeof v.location?.offset === "number" && v.location.offset > 0) tags.push(`off=0x${v.location.offset.toString(16)}`);
+    if (typeof v.location?.length === "number" && v.location.length > 0) tags.push(`len=${v.location.length}`);
+    if (typeof v.declaredAtLine === "number" && v.declaredAtLine > 0) tags.push(`L${v.declaredAtLine}`);
+    if (typeof v.sourceId === "number" && v.sourceId >= 0) tags.push(`src=${v.sourceId}`);
+    const note = v.note ? `  // ${v.note}` : "";
+    const tagText = tags.length > 0 ? `  [${tags.join(", ")}]` : "";
+    const value = `${display}${tagText}${note}`;
+    let ref = 0;
+    if (v.children && v.children.length > 0) {
+      ref = this.variableHandles.create({
+        title: `peek:${v.name}`,
+        content: { kind: "peek-children", parent: v } satisfies PeekChildrenBag
+      });
+    }
+    return {
+      name: v.name,
+      type: v.type,
+      value,
+      variablesReference: ref
+    };
+  }
+
   protected async readMemoryRequest(
     response: DebugProtocol.ReadMemoryResponse,
     args: DebugProtocol.ReadMemoryArguments
@@ -882,7 +1000,7 @@ export class InspethctDebugSession extends LoggingDebugSession {
       };
       this.sendResponse(response);
       // Refresh stopped state if a continue/step was issued.
-      if (/^(c|continue|n|s|step|next)\b/i.test(args.expression.trim())) {
+      if (/^(c|continue|n|s|step|next|si|stepin|so|stepout)\b/i.test(args.expression.trim())) {
         const state = this.runtime.getState();
         if (state?.done && !state.current) {
           this.sendEvent(new TerminatedEvent());
@@ -1085,6 +1203,22 @@ interface StorageListBag {
 interface StorageEntryBag {
   kind: "storage-entry";
   entry: import("./runtime").StorageVariable;
+}
+
+interface PeekRootBag {
+  kind: "peek-root";
+  snapshot?: import("./runtime").PeekSnapshot;
+}
+
+interface PeekListBag {
+  kind: "peek-list";
+  label: string;
+  items: import("./runtime").PeekVariable[];
+}
+
+interface PeekChildrenBag {
+  kind: "peek-children";
+  parent: import("./runtime").PeekVariable;
 }
 
 function hexToBytes(hex: string | undefined): Uint8Array {

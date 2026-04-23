@@ -20,6 +20,7 @@ import (
 	"inspethct/internal/forkengine/upstream"
 	"inspethct/internal/openchain"
 	"inspethct/internal/srcmap"
+	"inspethct/internal/varpeeker"
 )
 
 var errReplayPause = errors.New("jsonrpc: replay pause")
@@ -46,6 +47,7 @@ type ReplayPause struct {
 	Metadata          any                    `json:"metadata,omitempty"`
 	Step              forkengineTracePayload `json:"step"`
 	CallStack         []CallFrameInfo        `json:"callStack,omitempty"`
+	Peek              *varpeeker.Snapshot    `json:"peek,omitempty"`
 }
 
 // CallFrameInfo describes one frame on the active call stack at the time of
@@ -308,6 +310,7 @@ func (server *Server) replaySession(ctx context.Context, session *ReplaySession,
 	session.PendingPause = nil
 	session.Current = nil
 	session.CallFrames = session.CallFrames[:0]
+	session.PauseRequested.Store(false)
 
 	debugHooks := engine.NewSimpleHookRegistry()
 	_ = debugHooks.Register(&debugStepHook{session: session, continueMode: continueMode})
@@ -332,8 +335,29 @@ func (server *Server) replaySession(ctx context.Context, session *ReplaySession,
 			hookID:   fmt.Sprintf("auto-match-%d", i),
 		})
 	}
+	// Register one varpeeker memory-write tracker per loaded bundle so
+	// that pause-time variable peeking can attribute memory writes to
+	// their source range.
+	if session.VarTrackers == nil {
+		session.VarTrackers = make(map[string]*varpeeker.Tracker, len(session.Bundles))
+	}
+	for key, bundle := range session.Bundles {
+		if bundle == nil || bundle.Index == nil {
+			continue
+		}
+		tracker, ok := session.VarTrackers[strings.ToLower(key)]
+		if !ok {
+			tracker = varpeeker.NewTracker(bundle.Index)
+			session.VarTrackers[strings.ToLower(key)] = tracker
+		} else {
+			tracker.Reset()
+		}
+		_ = debugHooks.Register(tracker)
+	}
 	prepared.Config.Hooks = mergeHookRegistries(prepared.Config.Hooks, debugHooks)
+	session.ExecutionRunning.Store(true)
 	result, execErr := server.engine.ExecutePreparedCall(prepared)
+	session.ExecutionRunning.Store(false)
 	if execErr != nil && !errors.Is(execErr, errReplayPause) && result == nil {
 		return internalError(execErr)
 	}
@@ -412,6 +436,10 @@ func (hook *debugStepHook) Fire(ctx *engine.HookContext) (*engine.HookResult, er
 	}
 	if !hook.continueMode && stepIndex == hook.session.Position+1 {
 		hook.session.PendingPause = capturePause(hook.session, ctx, stepIndex, "step", "")
+		return &engine.HookResult{Action: engine.ActionHalt, Err: errReplayPause}, nil
+	}
+	if hook.continueMode && hook.session.PauseRequested.Load() {
+		hook.session.PendingPause = capturePause(hook.session, ctx, stepIndex, "pause", "")
 		return &engine.HookResult{Action: engine.ActionHalt, Err: errReplayPause}, nil
 	}
 	if breakpoint := hook.session.matchRootFunctionBreakpoint(ctx); breakpoint != nil {
@@ -648,6 +676,13 @@ func capturePause(session *ReplaySession, ctx *engine.HookContext, stepIndex int
 		}
 		pause.Storage = variablesForScope(ctx.State, contractAddr, bundle.Metadata.PersistentStorage, string(srcmap.StorageScopePersistent))
 		pause.Transient = variablesForScope(ctx.State, contractAddr, bundle.Metadata.TransientStorage, string(srcmap.StorageScopeTransient))
+		// Build the structured varpeeker snapshot in addition to the
+		// legacy fields above. Tracker is currently nil; future wiring
+		// can supply one for memory-write attribution.
+		peeker := varpeeker.New(bundle.Index, sessionTracker(session, codeAddr))
+		runtimeCode := ctx.State.Code(codeAddr)
+		snap := peeker.Snapshot(ctx.State, contractAddr, runtimeCode)
+		pause.Peek = &snap
 	}
 	return pause
 }
@@ -1665,6 +1700,52 @@ func bundleForCodeAddress(session *ReplaySession, codeAddr engine.Address) *cont
 		}
 	}
 	return nil
+}
+
+// sessionTracker returns the varpeeker tracker registered for the given
+// code address in this session, or nil when none is available (e.g. the
+// bundle was loaded mid-execution after replaySession setup ran).
+func sessionTracker(session *ReplaySession, codeAddr engine.Address) *varpeeker.Tracker {
+	if session == nil || len(session.VarTrackers) == 0 {
+		return nil
+	}
+	if tracker, ok := session.VarTrackers[addressHex(codeAddr)]; ok {
+		return tracker
+	}
+	if session.CodeAddr != nil {
+		if tracker, ok := session.VarTrackers[addressHex(*session.CodeAddr)]; ok {
+			return tracker
+		}
+	}
+	if len(session.VarTrackers) == 1 {
+		for _, tracker := range session.VarTrackers {
+			return tracker
+		}
+	}
+	return nil
+}
+
+// peekVariables implements gdb.peekVariables. Returns the
+// varpeeker.Snapshot from the current pause, or an error if the session
+// is not paused.
+func (server *Server) peekVariables(params []json.RawMessage) (any, *respError) {
+	sessionID, rpcErr := decodeStringParam(params)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	server.mu.Lock()
+	session, ok := server.sessions[sessionID]
+	server.mu.Unlock()
+	if !ok {
+		return nil, &respError{Code: -32602, Message: "unknown gdb session"}
+	}
+	if session.Current == nil {
+		return nil, &respError{Code: -32002, Message: "session is not paused"}
+	}
+	if session.Current.Peek == nil {
+		return varpeeker.Snapshot{}, nil
+	}
+	return session.Current.Peek, nil
 }
 
 func (server *Server) loadSourceBundle(ctx context.Context, params []json.RawMessage) (any, *respError) {
