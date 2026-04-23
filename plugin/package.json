@@ -1,32 +1,37 @@
 {
   "name": "inspethct-vscode",
   "displayName": "Inspethct Debugger",
-  "description": "VS Code debugger for Inspethct dbgserver",
+  "description": "Inspethct Interactive Solidity Debugger Extension for VSCode",
   "version": "0.0.3",
   "icon": "icon.png",
   "publisher": "DenrianWeiss",
-  "repository": "https://github.com/DenrianWeiss/inspethct",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DenrianWeiss/inspethct"
+  },
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.91.0"
   },
   "categories": [
-    "Debuggers",
-    "Other"
+    "Debuggers"
+  ],
+  "keywords": [
+    "solidity",
+    "ethereum"
   ],
   "main": "./out/extension.js",
   "activationEvents": [
     "onDebug",
     "onDebugResolve:inspethct",
-    "onLanguage:solidity",
-    "onCommand:inspethct.start",
-    "onCommand:inspethct.debugFunction",
-    "onCommand:inspethct.debugAtCursor",
-    "onCommand:inspethct.debugContract",
-    "onCommand:inspethct.importReplayFromChain",
-    "onCommand:inspethct.runSequenceScript",
-    "onCommand:inspethct.openSequenceBuilder",
-    "onCommand:inspethct.openRepl"
+    "onLanguage:solidity"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "This extension will run solidity debugging sessions which execute untrusted code. For security reasons, this extension cannot be used in untrusted workspaces."
+    }
+  },
   "contributes": {
     "breakpoints": [
       {
@@ -52,7 +57,7 @@
               "upstream": {
                 "type": "string",
                 "description": "Upstream RPC URL",
-                "default": "http://127.0.0.1:8545"
+                "default": ""
               },
               "dbgserverUrl": {
                 "type": "string",
@@ -60,7 +65,7 @@
               },
               "listenHost": {
                 "type": "string",
-                "default": "127.0.0.1"
+                "default": "localhost"
               },
               "stopOnEntry": {
                 "type": "boolean",
@@ -167,7 +172,7 @@
               "request": "launch",
               "name": "Inspethct Replay",
               "sessionType": "replay",
-              "upstream": "http://127.0.0.1:8545",
+              "upstream": "",
               "txHash": "0x",
               "autoStartDbgserver": true,
               "autoSourceBundle": true
@@ -181,7 +186,7 @@
               "request": "launch",
               "name": "Inspethct Call",
               "sessionType": "call",
-              "upstream": "http://127.0.0.1:8545",
+              "upstream": "",
               "call": {
                 "from": "0x0000000000000000000000000000000000000001",
                 "to": "0x",
@@ -259,23 +264,27 @@
         },
         "inspethct.defaultUpstream": {
           "type": "string",
-          "default": "http://127.0.0.1:8545"
+          "default": "",
+          "description": "Default Ethereum RPC URL used when no upstream is specified in the launch config."
         },
         "inspethct.defaultFork": {
           "type": "string",
-          "default": "cancun"
+          "default": "cancun",
+          "description": "Default EVM fork name (e.g. cancun, shanghai, paris) applied to new debug sessions."
         },
         "inspethct.defaultBlock": {
           "type": "string",
-          "default": "latest"
+          "default": "latest",
+          "description": "Default block tag or number used when no block is specified in the launch config."
         },
         "inspethct.defaultForkMode": {
           "type": "string",
-          "default": "diff"
+          "default": "diff",
+          "description": "Default fork mode: 'diff' caches writes locally; 'pinned' fixes state to a specific block."
         },
         "inspethct.explorerApiBase": {
           "type": "string",
-          "default": "https://api.etherscan.io/v2/api",
+          "default": "",
           "description": "Block explorer API base URL used as fallback for source detection."
         },
         "inspethct.explorerApiKey": {

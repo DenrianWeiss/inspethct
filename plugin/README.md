@@ -1,6 +1,6 @@
 # Inspethct VS Code Plugin
 
-This extension provides interactive Solidity debugging through inspethctd dbgserver.
+This extension provides interactive Solidity debugging through inspethctd dbgserver. Please notice that this plugin need corresponding dbgserver to work, you can download it manually.
 
 ## Core Features
 

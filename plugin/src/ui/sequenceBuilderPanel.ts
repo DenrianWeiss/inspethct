@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { randomBytes } from "crypto";
 import { InspethctLaunchConfig, SequenceScript, SequenceStep } from "../types";
 import { encodeFunctionInput, functionInputsForSignature, scanWorkspaceAbiCatalog } from "../services/abiCatalog";
 
@@ -55,6 +56,7 @@ interface AbiContext {
 
 export class SequenceBuilderPanel {
   static readonly viewType = "inspethct.sequenceBuilder";
+  private static currentPanel: vscode.WebviewPanel | undefined;
   private readonly abiContexts = new Map<string, AbiContext>();
 
   static open(
@@ -62,6 +64,11 @@ export class SequenceBuilderPanel {
     defaults: { upstream: string; block: string; fork: string; forkMode: string },
     onStart: (config: InspethctLaunchConfig) => Promise<void>
   ): void {
+    if (SequenceBuilderPanel.currentPanel) {
+      SequenceBuilderPanel.currentPanel.reveal(vscode.ViewColumn.Active);
+      return;
+    }
+
     const panel = vscode.window.createWebviewPanel(
       SequenceBuilderPanel.viewType,
       "Inspethct Sequence Builder",
@@ -71,6 +78,11 @@ export class SequenceBuilderPanel {
         retainContextWhenHidden: true
       }
     );
+
+    SequenceBuilderPanel.currentPanel = panel;
+    panel.onDidDispose(() => {
+      SequenceBuilderPanel.currentPanel = undefined;
+    });
 
     const instance = new SequenceBuilderPanel(panel, context, defaults, onStart);
     instance.render();
@@ -88,7 +100,7 @@ export class SequenceBuilderPanel {
   }
 
   private render(): void {
-    this.panel.webview.html = this.html(this.defaults);
+    this.panel.webview.html = this.html(this.panel.webview, this.defaults);
   }
 
   private async handleMessage(message: BuilderMessage): Promise<void> {
@@ -218,7 +230,8 @@ export class SequenceBuilderPanel {
     }
   }
 
-  private html(defaults: { upstream: string; block: string; fork: string; forkMode: string }): string {
+  private html(webview: vscode.Webview, defaults: { upstream: string; block: string; fork: string; forkMode: string }): string {
+    const nonce = randomBytes(16).toString("hex");
     const initial = {
       name: "Visual Sequence",
       upstream: defaults.upstream,
@@ -245,21 +258,22 @@ export class SequenceBuilderPanel {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
   <style>
     :root {
-      --bg: #111822;
-      --card: #192434;
-      --line: #33475f;
-      --text: #e7eef8;
-      --muted: #9fb3ca;
-      --accent: #3fb17e;
-      --accent-2: #4d9fff;
-      --danger: #dc5b6f;
+      --bg: var(--vscode-editor-background, #111822);
+      --card: var(--vscode-editorWidget-background, #192434);
+      --line: var(--vscode-widget-border, #33475f);
+      --text: var(--vscode-editor-foreground, #e7eef8);
+      --muted: var(--vscode-descriptionForeground, #9fb3ca);
+      --accent: var(--vscode-button-background, #3fb17e);
+      --accent-2: var(--vscode-button-secondaryBackground, #4d9fff);
+      --danger: var(--vscode-errorForeground, #dc5b6f);
     }
     body {
       margin: 0;
       font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
-      background: radial-gradient(circle at top right, #24374f, var(--bg) 45%);
+      background: var(--bg);
       color: var(--text);
     }
     .container {
@@ -308,9 +322,9 @@ export class SequenceBuilderPanel {
     input, select {
       width: 100%;
       box-sizing: border-box;
-      border: 1px solid var(--line);
-      background: #0f1824;
-      color: var(--text);
+      border: 1px solid var(--vscode-input-border, var(--line));
+      background: var(--vscode-input-background, #0f1824);
+      color: var(--vscode-input-foreground, var(--text));
       border-radius: 8px;
       padding: 8px;
       font-size: 12px;
@@ -436,7 +450,7 @@ export class SequenceBuilderPanel {
     <div id="steps"></div>
   </div>
 
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const state = ${JSON.stringify(initial)};
 
