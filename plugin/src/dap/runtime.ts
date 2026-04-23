@@ -140,6 +140,12 @@ interface NativeSequenceResponse {
   activeSession?: GdbSessionState;
 }
 
+export interface FunctionBreakpointSpec {
+  id: string;
+  signature: string;
+  address?: string;
+}
+
 export class InspethctRuntime {
   private rpc?: RpcClient;
   private endpoint = "";
@@ -149,6 +155,9 @@ export class InspethctRuntime {
   private readonly managedProcessKey: string;
   private readonly sourcePathToName = new Map<string, string>();
   private readonly sourcePathToBreakpointIds = new Map<string, string[]>();
+  private readonly sourcePathToFunctionBreakpointIds = new Map<string, string[]>();
+  private readonly sourcePathToLines = new Map<string, number[]>();
+  private readonly sourcePathToFunctionBreakpoints = new Map<string, FunctionBreakpointSpec[]>();
   private capabilities?: DbgserverCapabilities;
   private readonly autoLoadedAddresses = new Set<string>();
 
@@ -254,6 +263,7 @@ export class InspethctRuntime {
     this.ensureRpc();
     const sourceName = this.resolveSourceName(filePath);
     this.sourcePathToName.set(filePath, sourceName);
+    this.sourcePathToLines.set(filePath, [...lines]);
     this.notifier?.info(`[runtime] setSourceBreakpoints path=${filePath} sourceName=${sourceName} lines=${lines.join(",") || "<none>"}`);
 
     const existing = this.sourcePathToBreakpointIds.get(filePath) ?? [];
@@ -278,6 +288,36 @@ export class InspethctRuntime {
       this.notifier?.info(`[runtime] created source breakpoint id=${id}`);
     }
     this.sourcePathToBreakpointIds.set(filePath, created);
+  }
+
+  async setFunctionBreakpoints(filePath: string, breakpoints: FunctionBreakpointSpec[]): Promise<void> {
+    this.ensureRpc();
+    this.sourcePathToFunctionBreakpoints.set(filePath, breakpoints.map((bp) => ({ ...bp })));
+
+    const existing = this.sourcePathToFunctionBreakpointIds.get(filePath) ?? [];
+    for (const id of existing) {
+      await this.rpc!.call("gdb.deleteBreakpoint", [this.sessionId, { id }]);
+      this.notifier?.info(`[runtime] deleted function breakpoint id=${id}`);
+    }
+
+    const created: string[] = [];
+    for (const breakpoint of breakpoints) {
+      const body: Record<string, string> = { id: breakpoint.id, signature: breakpoint.signature };
+      if (breakpoint.address) {
+        body.address = breakpoint.address;
+      }
+      await this.rpc!.call("gdb.setFunctionBreakpoint", [this.sessionId, body]);
+      created.push(breakpoint.id);
+      this.notifier?.info(
+        `[runtime] created function breakpoint id=${breakpoint.id} signature=${breakpoint.signature}${breakpoint.address ? ` address=${breakpoint.address}` : ""}`
+      );
+    }
+    this.sourcePathToFunctionBreakpointIds.set(filePath, created);
+  }
+
+  async setFileBreakpoints(filePath: string, lines: number[], functionBreakpoints: FunctionBreakpointSpec[]): Promise<void> {
+    await this.setSourceBreakpoints(filePath, lines);
+    await this.setFunctionBreakpoints(filePath, functionBreakpoints);
   }
 
   getState(): GdbSessionState | undefined {
@@ -564,13 +604,11 @@ export class InspethctRuntime {
   }
 
   private async reapplyBreakpointsForFile(filePath: string): Promise<void> {
-    const ids = this.sourcePathToBreakpointIds.get(filePath) ?? [];
-    if (ids.length === 0) {
+    const lines = this.sourcePathToLines.get(filePath) ?? [];
+    const functionBreakpoints = this.sourcePathToFunctionBreakpoints.get(filePath) ?? [];
+    if (lines.length === 0 && functionBreakpoints.length === 0) {
       return;
     }
-    const lines = ids
-      .map((id) => Number.parseInt(id.slice(id.lastIndexOf("-") + 1), 10))
-      .filter((line) => Number.isFinite(line));
-    await this.setSourceBreakpoints(filePath, lines);
+    await this.setFileBreakpoints(filePath, lines, functionBreakpoints);
   }
 }

@@ -11,13 +11,15 @@ import {
   Breakpoint
 } from "@vscode/debugadapter";
 import * as path from "node:path";
+import { promises as fs } from "node:fs";
 import * as vscode from "vscode";
 import { DebugProtocol } from "@vscode/debugprotocol";
 import { InspethctLaunchConfig } from "../types";
-import { InspethctRuntime } from "./runtime";
+import { FunctionBreakpointSpec, InspethctRuntime } from "./runtime";
 import { DbgserverProcessManager } from "../services/processManager";
 import { runRepl } from "./repl";
 import { getAddress, toUtf8String } from "ethers";
+import { collectInterfaceBreakpointIndex, InterfaceFunctionEntry } from "../solidity/interfaceFunctionIndex";
 
 const THREAD_ID = 1;
 
@@ -30,7 +32,7 @@ export class InspethctDebugSession extends LoggingDebugSession {
   private launchConfig?: InspethctLaunchConfig;
   private runtime?: InspethctRuntime;
   private readonly variableHandles = new Handles<VariableBag>();
-  private readonly pendingBreakpoints = new Map<string, number[]>();
+  private readonly pendingBreakpoints = new Map<string, FileBreakpointPlan>();
   private readonly configurationDonePromise: Promise<void>;
   private resolveConfigurationDone?: () => void;
   private readonly processKey: string;
@@ -83,8 +85,8 @@ export class InspethctDebugSession extends LoggingDebugSession {
       });
       const state = await this.runtime.start();
 
-      for (const [filePath, lines] of this.pendingBreakpoints.entries()) {
-        await this.runtime.setSourceBreakpoints(filePath, lines);
+      for (const [filePath, plan] of this.pendingBreakpoints.entries()) {
+        await this.runtime.setFileBreakpoints(filePath, plan.sourceLines, plan.functionBreakpoints);
       }
 
       this.sendResponse(response);
@@ -172,36 +174,141 @@ export class InspethctDebugSession extends LoggingDebugSession {
       return;
     }
 
-    this.pendingBreakpoints.set(filePath, clientLines);
+    const plan = await this.buildFileBreakpointPlan(filePath, clientLines);
+    this.pendingBreakpoints.set(filePath, plan);
+
+    const responseByLine = new Map<number, DebugProtocol.Breakpoint>();
+    for (const line of plan.skippedInterfaceLines) {
+      responseByLine.set(line, {
+        verified: false,
+        line,
+        message: "Interface non-function lines do not map to runtime bytecode."
+      });
+    }
+
     if (this.runtime) {
       try {
-        await this.runtime.setSourceBreakpoints(filePath, clientLines);
+        await this.runtime.setFileBreakpoints(filePath, plan.sourceLines, plan.functionBreakpoints);
       } catch (error) {
         const message = String(error);
         const knownMissingSource = /source\s+".+"\s+not found/i.test(message) && message.includes("gdb.setSourceBreakpoint");
         this.sendEvent(new OutputEvent(`[dap] set breakpoint failed file=${filePath}: ${message}\n`, "stderr"));
         response.body = {
-          breakpoints: clientLines.map(
-            (line): DebugProtocol.Breakpoint => ({
+          breakpoints: clientLines.map((line): DebugProtocol.Breakpoint => {
+            const existing = responseByLine.get(line);
+            if (existing) {
+              return existing;
+            }
+            return {
               verified: false,
               line,
               message: knownMissingSource
                 ? "This file is not in the loaded contract source bundle."
                 : `Failed to set breakpoint: ${message}`
-            })
-          )
+            };
+          })
         };
         this.sendResponse(response);
         return;
       }
     }
 
-    this.sendEvent(new OutputEvent(`[dap] applied source breakpoints file=${filePath} count=${clientLines.length}\n`, "console"));
+    this.sendEvent(
+      new OutputEvent(
+        `[dap] applied breakpoints file=${filePath} source=${plan.sourceLines.length} function=${plan.functionBreakpoints.length} skippedInterface=${plan.skippedInterfaceLines.length}\n`,
+        "console"
+      )
+    );
 
     response.body = {
-      breakpoints: clientLines.map((line) => new Breakpoint(true, line))
+      breakpoints: clientLines.map((line) => responseByLine.get(line) || new Breakpoint(true, line))
     };
     this.sendResponse(response);
+  }
+
+  private async buildFileBreakpointPlan(filePath: string, lines: number[]): Promise<FileBreakpointPlan> {
+    const plan: FileBreakpointPlan = { sourceLines: [], functionBreakpoints: [], skippedInterfaceLines: [] };
+    if (lines.length === 0) {
+      return plan;
+    }
+
+    const document = await vscode.workspace.openTextDocument(filePath);
+    const index = collectInterfaceBreakpointIndex(document);
+    if (index.functions.length === 0 && index.ranges.length === 0) {
+      plan.sourceLines = [...lines];
+      return plan;
+    }
+
+    const sourceName = this.resolveSourceNameForFile(filePath);
+    const mapping = await this.loadDeploymentMapping();
+    const interfaceFunctionsByLine = new Map<number, InterfaceFunctionEntry[]>();
+    for (const fn of index.functions) {
+      const line1 = fn.line + 1;
+      const list = interfaceFunctionsByLine.get(line1) ?? [];
+      list.push(fn);
+      interfaceFunctionsByLine.set(line1, list);
+    }
+
+    for (const line of lines) {
+      const interfaceFunctions = interfaceFunctionsByLine.get(line) ?? [];
+      if (interfaceFunctions.length > 0) {
+        for (const fn of interfaceFunctions) {
+          const addresses = resolveMappedAddresses(mapping, sourceName, fn.interfaceName);
+          if (addresses.length === 0) {
+            plan.functionBreakpoints.push({
+              id: `bp-fn-${sourceName}-${line}-${fn.signature}`,
+              signature: fn.signature
+            });
+            continue;
+          }
+          for (const address of addresses) {
+            plan.functionBreakpoints.push({
+              id: `bp-fn-${sourceName}-${line}-${fn.signature}-${address}`,
+              signature: fn.signature,
+              address
+            });
+          }
+        }
+        continue;
+      }
+
+      if (isLineInInterface(line, index)) {
+        plan.skippedInterfaceLines.push(line);
+        continue;
+      }
+
+      plan.sourceLines.push(line);
+    }
+
+    plan.functionBreakpoints = dedupeFunctionBreakpoints(plan.functionBreakpoints);
+    return plan;
+  }
+
+  private resolveSourceNameForFile(filePath: string): string {
+    const root = (this.launchConfig as (InspethctLaunchConfig & { workspaceRoot?: string }) | undefined)?.workspaceRoot;
+    if (!root) {
+      return path.basename(filePath);
+    }
+    const relativePath = path.relative(root, filePath);
+    return relativePath.split(path.sep).join("/");
+  }
+
+  private async loadDeploymentMapping(): Promise<DeploymentMapping> {
+    const root = (this.launchConfig as (InspethctLaunchConfig & { workspaceRoot?: string }) | undefined)?.workspaceRoot;
+    if (!root) {
+      return {};
+    }
+    const mappingPath = path.join(root, "deployment-mapping.json");
+    try {
+      const content = await fs.readFile(mappingPath, "utf8");
+      const parsed = JSON.parse(content) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+      return parsed as DeploymentMapping;
+    } catch {
+      return {};
+    }
   }
 
   private isSolidityPath(filePath: string): boolean {
@@ -715,6 +822,96 @@ export class InspethctDebugSession extends LoggingDebugSession {
       new Promise<void>((resolve) => setTimeout(resolve, 5000))
     ]);
   }
+}
+
+interface FileBreakpointPlan {
+  sourceLines: number[];
+  functionBreakpoints: FunctionBreakpointSpec[];
+  skippedInterfaceLines: number[];
+}
+
+interface DeploymentMappingEntry {
+  name?: string;
+  contract?: string;
+  pull?: boolean;
+}
+
+type DeploymentMapping = Record<string, DeploymentMappingEntry>;
+
+function isLineInInterface(line: number, index: ReturnType<typeof collectInterfaceBreakpointIndex>): boolean {
+  for (const range of index.ranges) {
+    if (line >= range.startLine + 1 && line <= range.endLine + 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveMappedAddresses(mapping: DeploymentMapping, sourceName: string, interfaceName: string): string[] {
+  const normalizedSource = normalizeSourcePath(sourceName);
+  const normalizedInterface = interfaceName.toLowerCase();
+  const result: string[] = [];
+
+  for (const [addressRaw, entry] of Object.entries(mapping)) {
+    const address = normalizeAddress(addressRaw);
+    if (!address) {
+      continue;
+    }
+    const contract = String(entry?.contract ?? "").trim();
+    const name = String(entry?.name ?? "").trim();
+
+    if (contract.length > 0) {
+      const [pathPartRaw, namePartRaw] = splitContractHint(contract);
+      const pathPart = normalizeSourcePath(pathPartRaw);
+      const namePart = namePartRaw.toLowerCase();
+      const pathMatches = pathPart.length > 0 && pathPart === normalizedSource;
+      const nameMatches = namePart.length > 0 && namePart === normalizedInterface;
+      if (pathMatches || nameMatches) {
+        result.push(address);
+        continue;
+      }
+    }
+
+    if (name.length > 0 && name.toLowerCase() === normalizedInterface) {
+      result.push(address);
+    }
+  }
+
+  return Array.from(new Set(result));
+}
+
+function splitContractHint(contract: string): [string, string] {
+  const idx = contract.lastIndexOf(":");
+  if (idx < 0) {
+    return [contract, ""];
+  }
+  return [contract.slice(0, idx), contract.slice(idx + 1)];
+}
+
+function normalizeSourcePath(value: string): string {
+  return value.split("\\").join("/").replace(/^\.\//, "").trim();
+}
+
+function normalizeAddress(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed.toLowerCase();
+}
+
+function dedupeFunctionBreakpoints(items: FunctionBreakpointSpec[]): FunctionBreakpointSpec[] {
+  const seen = new Set<string>();
+  const out: FunctionBreakpointSpec[] = [];
+  for (const item of items) {
+    const key = `${item.signature}|${item.address ?? ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
 }
 
 function flattenObject(content: unknown): DebugProtocol.Variable[] {
