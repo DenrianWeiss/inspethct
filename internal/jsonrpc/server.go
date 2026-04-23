@@ -70,6 +70,14 @@ type ReplaySession struct {
 	matchedAddresses map[string]struct{}
 	// AutoMatchCfg is the project-level config for call-stack auto-matching.
 	AutoMatchCfg *contractmeta.AutoMatchConfig
+	// SelectorIndex caches per-bundle selector lookup data (signature +
+	// parsed gethabi.Method for argument decoding), keyed by lowercased
+	// code address. Populated lazily in capturePause.
+	SelectorIndex map[string]*BundleSelectorIndex `json:"-"`
+	// OpenchainCache memoises selector → signature lookups against the
+	// public OpenChain (4byte) signature database. Empty string means
+	// "lookup attempted, no signature available" (negative cache).
+	OpenchainCache map[string]string `json:"-"`
 }
 
 type request struct {

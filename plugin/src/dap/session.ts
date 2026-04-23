@@ -327,8 +327,31 @@ export class InspethctDebugSession extends LoggingDebugSession {
       return prefix;
     }
     const tag = frame.callType ? `[${frame.callType}]` : "";
-    const sel = frame.selector ? ` ${frame.selector}` : "";
-    return `${prefix} ${tag} ${frame.codeAddress}${sel}`.trim();
+    const contract = frame.contractName || frame.codeAddress;
+    let func = frame.functionName || frame.functionSignature;
+    if (!func && frame.selector) {
+      func = frame.selector;
+    }
+    const funcLabel = func ? `${contract}.${func}` : contract;
+    const srcTag = frame.functionSource === "openchain" ? " (4byte)" : "";
+    const argsPreview = this.formatArgsPreview(frame.arguments);
+    return `${prefix} ${tag} ${funcLabel}${argsPreview}${srcTag}`.trim();
+  }
+
+  private formatArgsPreview(args?: import("./runtime").CallArgument[]): string {
+    if (!args || args.length === 0) {
+      return "";
+    }
+    const parts = args.map((a) => `${a.name}=${this.truncatePreview(a.value)}`);
+    return `(${parts.join(", ")})`;
+  }
+
+  private truncatePreview(value: string): string {
+    const max = 40;
+    if (value.length <= max) {
+      return value;
+    }
+    return `${value.slice(0, max - 1)}…`;
   }
 
   protected scopesRequest(response: DebugProtocol.ScopesResponse, _args: DebugProtocol.ScopesArguments): void {

@@ -200,7 +200,27 @@ async function handleInfo(args: string[], runtime: InspethctRuntime): Promise<st
         return "no call stack info yet";
       }
       return frames
-        .map((f) => `  #${f.depth} [${f.callType ?? "?"}] ${f.codeAddress}${f.selector ? `  selector=${f.selector}` : ""}${f.inputSize ? `  input=${f.inputSize}B` : ""}`)
+        .map((f) => {
+          const contract = f.contractName || f.codeAddress;
+          const fn = f.functionSignature || f.functionName || f.selector || "";
+          const fnTag = fn ? ` ${fn}` : "";
+          const sourceTag = f.functionSource === "openchain" ? " (4byte)" : "";
+          const header = `  #${f.depth} [${f.callType ?? "?"}] ${contract}${fnTag}${sourceTag}${f.inputSize ? `  input=${f.inputSize}B` : ""}`;
+          const lines = [header];
+          if (f.callerAddress) {
+            lines.push(`        from=${f.callerAddress}${f.value ? ` value=${f.value}` : ""}`);
+          } else if (f.value) {
+            lines.push(`        value=${f.value}`);
+          }
+          if (f.arguments && f.arguments.length > 0) {
+            for (const arg of f.arguments) {
+              lines.push(`        ${arg.name}: ${arg.type} = ${arg.value}`);
+            }
+          } else if (f.argumentsError) {
+            lines.push(`        arguments: <decode failed: ${f.argumentsError}>`);
+          }
+          return lines.join("\n");
+        })
         .join("\n");
     }
     case "memory": {

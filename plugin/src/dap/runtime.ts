@@ -46,13 +46,28 @@ export interface LocalVariable {
   note?: string;
 }
 
+export interface CallArgument {
+  name: string;
+  type: string;
+  value: string;
+}
+
 export interface CallFrameInfo {
   depth: number;
   contractAddress: string;
   codeAddress: string;
+  callerAddress?: string;
   callType?: string;
   selector?: string;
   inputSize: number;
+  input?: string;
+  value?: string;
+  contractName?: string;
+  functionSignature?: string;
+  functionName?: string;
+  functionSource?: string;
+  arguments?: CallArgument[];
+  argumentsError?: string;
 }
 
 export interface GdbSessionState {

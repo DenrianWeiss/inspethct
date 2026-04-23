@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	gethabi "github.com/ethereum/go-ethereum/accounts/abi"
 
@@ -17,6 +18,7 @@ import (
 	"inspethct/internal/engine"
 	"inspethct/internal/forkengine"
 	"inspethct/internal/forkengine/upstream"
+	"inspethct/internal/openchain"
 	"inspethct/internal/srcmap"
 )
 
@@ -54,9 +56,18 @@ type CallFrameInfo struct {
 	Depth           int    `json:"depth"`
 	ContractAddress string `json:"contractAddress"`
 	CodeAddress     string `json:"codeAddress"`
+	CallerAddress   string `json:"callerAddress,omitempty"`
 	CallType        string `json:"callType,omitempty"` // "root" | "call" | "delegatecall" | "staticcall" | "callcode" | "create"
 	Selector        string `json:"selector,omitempty"`
 	InputSize       int    `json:"inputSize"`
+	// Input is the full hex-encoded calldata of the frame. Used to decode
+	// Arguments when a function signature is resolved during enrichment.
+	Input string `json:"input,omitempty"`
+	// Value is the wei value sent with the call (decimal string). Empty when
+	// the value is zero. Note: for DELEGATECALL/STATICCALL the EVM forwards
+	// the parent frame's value; this field reflects what ContractCallValue()
+	// reports inside the new frame.
+	Value string `json:"value,omitempty"`
 	// ContractName is resolved from the loaded source bundle for CodeAddress.
 	ContractName string `json:"contractName,omitempty"`
 	// FunctionSignature is the canonical "name(types)" form of the called
@@ -69,6 +80,20 @@ type CallFrameInfo struct {
 	// FunctionSource indicates where FunctionSignature came from: "abi",
 	// "openchain", or empty when unresolved.
 	FunctionSource string `json:"functionSource,omitempty"`
+	// Arguments is the decoded calldata, populated only when both a function
+	// signature is available and the calldata could be parsed against it.
+	Arguments []CallArgument `json:"arguments,omitempty"`
+	// ArgumentsError surfaces decoding failures so the UI can show a hint
+	// instead of silently omitting arguments.
+	ArgumentsError string `json:"argumentsError,omitempty"`
+}
+
+// CallArgument is one decoded calldata argument. Value is the formatted text
+// (hex for bytes/address, decimal for integers, JSON-style for arrays/tuples).
+type CallArgument struct {
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Value string `json:"value"`
 }
 
 // MemoryRegionInfo describes a contiguous range of EVM memory with a
@@ -613,6 +638,7 @@ func capturePause(session *ReplaySession, ctx *engine.HookContext, stepIndex int
 	pause.Stack = encodeStackSnapshot(ctx.State)
 	if len(session.CallFrames) > 0 {
 		pause.CallStack = append([]CallFrameInfo(nil), session.CallFrames...)
+		enrichCallStack(session, pause.CallStack)
 	}
 	if bundle := bundleForCodeAddress(session, codeAddr); bundle != nil {
 		pause.Metadata = bundle.Metadata
@@ -705,8 +731,13 @@ func newFrame(ctx *engine.HookContext, depth int, callType string) CallFrameInfo
 	}
 	frame.ContractAddress = addressHex(ctx.State.ContractAddress())
 	frame.CodeAddress = addressHex(ctx.State.ContractCodeAddr())
+	frame.CallerAddress = addressHex(ctx.State.ContractCaller())
+	if value := ctx.State.ContractCallValue(); value != nil && value.Sign() != 0 {
+		frame.Value = value.String()
+	}
 	if input := ctx.State.ContractCallInput(); len(input) > 0 {
 		frame.InputSize = len(input)
+		frame.Input = "0x" + hex.EncodeToString(input)
 		if len(input) >= 4 {
 			frame.Selector = "0x" + hex.EncodeToString(input[:4])
 		}
@@ -725,13 +756,296 @@ func mergeFrame(prev CallFrameInfo, ctx *engine.HookContext, depth int) CallFram
 	if next.CodeAddress == "" || next.CodeAddress == "0x0000000000000000000000000000000000000000" {
 		next.CodeAddress = prev.CodeAddress
 	}
+	if next.CallerAddress == "" || next.CallerAddress == "0x0000000000000000000000000000000000000000" {
+		next.CallerAddress = prev.CallerAddress
+	}
 	if next.Selector == "" {
 		next.Selector = prev.Selector
 	}
 	if next.InputSize == 0 {
 		next.InputSize = prev.InputSize
 	}
+	if next.Input == "" {
+		next.Input = prev.Input
+	}
+	if next.Value == "" {
+		next.Value = prev.Value
+	}
 	return next
+}
+
+// BundleSelectorIndex caches the parsed ABI of one bundle so the call-stack
+// enricher can both name and decode calls without reparsing on every step.
+type BundleSelectorIndex struct {
+	Signatures map[string]string          // selector hex (no 0x) -> "name(types)"
+	Methods    map[string]*gethabi.Method // selector hex (no 0x) -> ABI method
+}
+
+// enrichCallStack annotates each frame with ContractName, FunctionSignature
+// and FunctionName, resolving from the loaded source bundles when possible
+// and falling back to the OpenChain (4byte) signature database for unknown
+// selectors. Lookups are cached on the session.
+func enrichCallStack(session *ReplaySession, frames []CallFrameInfo) {
+	if session == nil || len(frames) == 0 {
+		return
+	}
+	for i := range frames {
+		frame := &frames[i]
+		codeKey := strings.ToLower(frame.CodeAddress)
+		var method *gethabi.Method
+		if bundle, ok := session.Bundles[codeKey]; ok && bundle != nil {
+			if frame.ContractName == "" {
+				frame.ContractName = bundle.ContractName
+			}
+			if frame.Selector != "" {
+				if sig, m, ok := lookupSelectorInBundle(session, codeKey, bundle, frame.Selector); ok {
+					if frame.FunctionSignature == "" {
+						assignFunctionSignature(frame, sig, "abi")
+					}
+					method = m
+				}
+			}
+		}
+		if frame.FunctionSignature == "" && frame.Selector != "" {
+			if signature, ok := lookupSelectorInOpenchain(session, frame.Selector); ok {
+				assignFunctionSignature(frame, signature, "openchain")
+			}
+		}
+		// Constructor calls have no selector — surface "constructor" as the
+		// function name so the UI shows something meaningful.
+		if frame.FunctionSignature == "" && (frame.CallType == "create" || frame.CallType == "create2") {
+			assignFunctionSignature(frame, "constructor", "")
+		}
+		// Decode arguments when both signature and calldata are available.
+		if len(frame.Arguments) == 0 && frame.ArgumentsError == "" && frame.FunctionSignature != "" && frame.Input != "" && frame.InputSize > 4 {
+			if method == nil {
+				method = synthesiseMethodFromSignature(frame.FunctionSignature)
+			}
+			if method != nil {
+				args, err := decodeCallArguments(method, frame.Input)
+				if err != nil {
+					frame.ArgumentsError = err.Error()
+				} else {
+					frame.Arguments = args
+				}
+			}
+		}
+	}
+}
+
+func assignFunctionSignature(frame *CallFrameInfo, signature string, source string) {
+	signature = strings.TrimSpace(signature)
+	if signature == "" {
+		return
+	}
+	frame.FunctionSignature = signature
+	frame.FunctionSource = source
+	if idx := strings.IndexByte(signature, '('); idx > 0 {
+		frame.FunctionName = signature[:idx]
+	} else {
+		frame.FunctionName = signature
+	}
+}
+
+// lookupSelectorInBundle returns the canonical "name(types)" signature and
+// parsed ABI method for the given selector, building (and caching) a
+// per-bundle index on demand.
+func lookupSelectorInBundle(session *ReplaySession, codeKey string, bundle *contractmeta.Bundle, selector string) (string, *gethabi.Method, bool) {
+	if session.SelectorIndex == nil {
+		session.SelectorIndex = make(map[string]*BundleSelectorIndex)
+	}
+	index, ok := session.SelectorIndex[codeKey]
+	if !ok {
+		index = buildSelectorIndex(bundle)
+		session.SelectorIndex[codeKey] = index
+	}
+	if index == nil {
+		return "", nil, false
+	}
+	key := strings.ToLower(strings.TrimPrefix(selector, "0x"))
+	signature, sigOK := index.Signatures[key]
+	if !sigOK || signature == "" {
+		return "", nil, false
+	}
+	return signature, index.Methods[key], true
+}
+
+// buildSelectorIndex parses the bundle's ABI into a selector→signature/method
+// pair. Returns an empty index (not nil) on failure so subsequent lookups
+// short-circuit without retrying.
+func buildSelectorIndex(bundle *contractmeta.Bundle) *BundleSelectorIndex {
+	index := &BundleSelectorIndex{
+		Signatures: map[string]string{},
+		Methods:    map[string]*gethabi.Method{},
+	}
+	if bundle == nil || len(bundle.ABIJSON) == 0 {
+		return index
+	}
+	parsed, err := gethabi.JSON(strings.NewReader(string(bundle.ABIJSON)))
+	if err != nil {
+		return index
+	}
+	for name := range parsed.Methods {
+		method := parsed.Methods[name]
+		if len(method.ID) < 4 {
+			continue
+		}
+		key := hex.EncodeToString(method.ID[:4])
+		index.Signatures[key] = method.Sig
+		copied := method
+		index.Methods[key] = &copied
+	}
+	return index
+}
+
+// synthesiseMethodFromSignature builds an ABI Method from a canonical
+// "name(types)" string. Returns nil for tuple/complex types we cannot
+// represent without the original ABI.
+func synthesiseMethodFromSignature(signature string) *gethabi.Method {
+	openIdx := strings.IndexByte(signature, '(')
+	closeIdx := strings.LastIndexByte(signature, ')')
+	if openIdx <= 0 || closeIdx <= openIdx {
+		return nil
+	}
+	name := signature[:openIdx]
+	inner := signature[openIdx+1 : closeIdx]
+	var typeNames []string
+	if strings.TrimSpace(inner) != "" {
+		typeNames = strings.Split(inner, ",")
+	}
+	args := make([]gethabi.ArgumentMarshaling, 0, len(typeNames))
+	for i, t := range typeNames {
+		t = strings.TrimSpace(t)
+		if strings.Contains(t, "tuple") || strings.Contains(t, "(") {
+			return nil // unsupported without full ABI
+		}
+		args = append(args, gethabi.ArgumentMarshaling{Name: fmt.Sprintf("arg%d", i), Type: t})
+	}
+	definition, err := json.Marshal([]map[string]any{{"type": "function", "name": name, "inputs": args, "outputs": []any{}}})
+	if err != nil {
+		return nil
+	}
+	parsed, err := gethabi.JSON(strings.NewReader(string(definition)))
+	if err != nil {
+		return nil
+	}
+	method, ok := parsed.Methods[name]
+	if !ok {
+		return nil
+	}
+	return &method
+}
+
+// decodeCallArguments unpacks the calldata (hex string, with or without 0x)
+// against the given ABI method, formatting each argument as a printable
+// string suitable for display in the debugger UI.
+func decodeCallArguments(method *gethabi.Method, inputHex string) ([]CallArgument, error) {
+	raw, err := decodeBytes(inputHex)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) < 4 {
+		return nil, fmt.Errorf("calldata shorter than selector")
+	}
+	values, err := method.Inputs.UnpackValues(raw[4:])
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CallArgument, 0, len(method.Inputs))
+	for i, input := range method.Inputs {
+		argName := input.Name
+		if argName == "" {
+			argName = fmt.Sprintf("arg%d", i)
+		}
+		var value any
+		if i < len(values) {
+			value = values[i]
+		}
+		out = append(out, CallArgument{Name: argName, Type: input.Type.String(), Value: formatArgumentValue(value)})
+	}
+	return out, nil
+}
+
+// formatArgumentValue renders an unpacked ABI value in a compact, human
+// readable form. Bytes/address types are hex-encoded; integers use decimal;
+// arrays/slices/structs are JSON-encoded as a fallback.
+func formatArgumentValue(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case *big.Int:
+		if v == nil {
+			return "0"
+		}
+		return v.String()
+	case engine.Address:
+		return addressHex(v)
+	case []byte:
+		return "0x" + hex.EncodeToString(v)
+	}
+	// gethabi returns [N]byte arrays for fixed bytes; render as hex.
+	if buf, ok := tryFixedBytes(value); ok {
+		return "0x" + hex.EncodeToString(buf)
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprintf("%v", value)
+	}
+	return string(encoded)
+}
+
+// tryFixedBytes detects gethabi's fixed-size byte arrays (e.g. [32]byte,
+// [4]byte) reflectively without pulling in the reflect package by leaning
+// on the json encoder for unrecognised types. We only special-case the
+// common 20-byte (address) and 32-byte (bytes32) shapes that show up in
+// EVM calldata.
+func tryFixedBytes(value any) ([]byte, bool) {
+	switch v := value.(type) {
+	case [4]byte:
+		return v[:], true
+	case [20]byte:
+		return v[:], true
+	case [32]byte:
+		return v[:], true
+	}
+	return nil, false
+}
+
+// lookupSelectorInOpenchain consults the public OpenChain signature database
+// for an unknown selector. Results (including misses) are cached on the
+// session to keep pause latency bounded. The HTTP call uses a short timeout
+// so a slow lookup does not stall the debugger.
+func lookupSelectorInOpenchain(session *ReplaySession, selector string) (string, bool) {
+	normalized := "0x" + strings.ToLower(strings.TrimPrefix(selector, "0x"))
+	if len(normalized) != 10 {
+		return "", false
+	}
+	if session.OpenchainCache == nil {
+		session.OpenchainCache = make(map[string]string)
+	}
+	if cached, ok := session.OpenchainCache[normalized]; ok {
+		return cached, cached != ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	signatures, err := openchain.Client{}.LookupFunction(ctx, normalized)
+	if err != nil || len(signatures) == 0 {
+		session.OpenchainCache[normalized] = ""
+		return "", false
+	}
+	signature := strings.TrimSpace(signatures[0])
+	session.OpenchainCache[normalized] = signature
+	if signature == "" {
+		return "", false
+	}
+	return signature, true
 }
 
 // classifyCallType inspects the immediately preceding opcode (still
@@ -2408,8 +2722,8 @@ type contractPreloadHook struct {
 }
 
 func (h *contractPreloadHook) Type() engine.HookType { return h.hookType }
-func (h *contractPreloadHook) OneTime() bool          { return false }
-func (h *contractPreloadHook) ID() string             { return h.hookID }
+func (h *contractPreloadHook) OneTime() bool         { return false }
+func (h *contractPreloadHook) ID() string            { return h.hookID }
 
 func (h *contractPreloadHook) Fire(ctx *engine.HookContext) (*engine.HookResult, error) {
 	if h.session.AutoMatchCfg == nil || ctx == nil || ctx.Call == nil {
