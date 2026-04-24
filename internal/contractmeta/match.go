@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+
+	"inspethct/internal/contractmeta/bytematch"
 )
 
 // stripMetadataFooter removes the trailing Solidity CBOR metadata blob (ipfs/bzzr1 hash + 2 length bytes)
@@ -80,11 +82,41 @@ const (
 	localMatchLengthRatio = 0.9 // |a-b|/max(a,b) must be <= 1 - this
 	localMatchPrefixRatio = 0.6 // matched/total must be >= this to be a candidate
 	localMatchMinBytes    = 64  // additionally require at least this many matched bytes
+	matchEngineEnvKey     = "INSPETHCT_MATCH_ENGINE"
 )
 
 // FindLocalBytecodeMatches scans local Foundry/Hardhat build-info under projectRoot looking for a
 // contract whose deployedBytecode matches onChain. Returns matches sorted by best score first.
 func FindLocalBytecodeMatches(projectRoot string, onChain []byte) ([]BytecodeMatch, error) {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(matchEngineEnvKey)), "legacy") {
+		return findLocalBytecodeMatchesLegacy(projectRoot, onChain)
+	}
+	return findLocalBytecodeMatchesV2(projectRoot, onChain)
+}
+
+func findLocalBytecodeMatchesV2(projectRoot string, onChain []byte) ([]BytecodeMatch, error) {
+	results, err := bytematch.FindMatches(projectRoot, onChain)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	out := make([]BytecodeMatch, 0, len(results))
+	for _, match := range results {
+		out = append(out, BytecodeMatch{
+			SourceName:    match.SourceName,
+			ContractName:  match.ContractName,
+			BuildInfoPath: match.BuildInfoPath,
+			MatchedBytes:  match.MatchedBytes,
+			TotalBytes:    match.TotalBytes,
+			Exact:         match.Exact,
+		})
+	}
+	return out, nil
+}
+
+func findLocalBytecodeMatchesLegacy(projectRoot string, onChain []byte) ([]BytecodeMatch, error) {
 	if len(onChain) == 0 {
 		return nil, nil
 	}
